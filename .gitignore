@@ -1,0 +1,25 @@
+# Build output
+build/
+[Bb]in/
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+*.dll
+*.tlog
+*.lastbuildstate
+
+# Generated reflection (nukegen prebuild writes it from include/NukeVFX/Particles.h)
+src/NukeVFX.gen.inc
+
+# Visual Studio / IDE
+.vs/
+*.user
+*.suo
+
+# logs / OS
+*.log
+Thumbs.db
+.DS_Store
