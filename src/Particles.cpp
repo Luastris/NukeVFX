@@ -7,6 +7,8 @@
 #include <API/Model/Time.h>
 #include <API/Model/Rand.h>
 #include <API/Model/DebugDraw.h>
+#include <API/Model/Light.h>          // FrameLights: glowing particles light the scene
+#include <API/Model/BendVolumes.h>    // force fields bend foliage too (7.4)
 #include <API/Model/MeshRenderer.h>   // Surface collision + editor-preview scene rays
 #include <API/Model/Events.h>         // vfx.collision events (point/normal/atom/uv)
 #include <API/Model/World.h>          // editor-preview World-mode collision scans the scene
@@ -41,10 +43,33 @@ void ForceField::Destroy()
 	boost::mutex::scoped_lock l(gFFLock);
 	gFields.erase(std::remove(gFields.begin(), gFields.end(), this), gFields.end());
 }
-// Selected-field gizmo (editor): the influence sphere, tinted by mode.
+// Selected-field gizmo (editor) + the field's FOLIAGE side: every enabled field submits
+// itself as an engine BendVolume once per frame, so grass bends in force fields exactly
+// like particles do (Attract pulls in, Repel pushes out, Vortex swirls, Turbulence jitters).
 void ForceField::OnRender(iRender*, RenderPhase phase)
 {
 	if (phase != RenderPhase::Overlay || !transform) return;
+	if (enabled)
+	{
+		const unsigned long long fr = Time::getSingleton()->frame;
+		if (fr != bendSubmitFrame)   // OnRender fires per pass/camera — submit once
+		{
+			bendSubmitFrame = fr;
+			Vector3 c = transform->globalPosition();
+			BendVolume v;
+			v.pos[0] = (float)c.x; v.pos[1] = (float)c.y; v.pos[2] = (float)c.z;
+			v.radius = radius > 0.01f ? radius : 0.01f;
+			v.falloff = falloff;
+			switch (mode)
+			{
+				case 0:  v.mode = 1; v.strength = -strength; break;   // attract = inward radial
+				case 1:  v.mode = 1; v.strength = strength;  break;   // repel
+				case 2:  v.mode = 2; v.strength = strength;  break;   // vortex
+				default: v.mode = 3; v.strength = strength;  break;   // turbulence
+			}
+			BendVolumes::Submit(v);
+		}
+	}
 	AppInstance* app = AppInstance::GetSingleton();
 	if (!app->isEditor() || app->selectedInHieararchy != atom) return;
 	static const Color kModeCol[4] = { Color(0.4, 0.8, 1.0, 1.0),   // attract: blue
@@ -444,6 +469,27 @@ void ParticleEmitter::Init(Atom* parent)
 void ParticleEmitter::Destroy()
 {
 	if (instBuf && instOwner) { instOwner->destroyInstanceBuffer(instBuf); instBuf = 0; instOwner = nullptr; }
+	FreeRTMesh();
+}
+
+// Release the RT meshes: the renderer's caches (vertex buffers, BLAS, concatenated-buffer
+// offsets) key on the Mesh pointer — invalidate BEFORE delete or a rebuilt TLAS dereferences
+// freed memory (the InstancedMesh RT-chunk rule).
+static void FreeOneRTMesh(Mesh*& m, Material*& mat, int& cap)
+{
+	if (m)
+	{
+		if (iRender* r = AppInstance::GetSingleton()->render) r->invalidateMesh(m);
+		delete[] m->vertexArray; delete[] m->normalArray; delete[] m->uvArray; delete[] m->rtColorArray;
+		m->vertexArray = m->normalArray = m->uvArray = m->rtColorArray = nullptr;
+		delete m; m = nullptr;
+	}
+	delete mat; mat = nullptr; cap = 0;
+}
+void ParticleEmitter::FreeRTMesh()
+{
+	FreeOneRTMesh(rtMesh, rtMat, rtCap);
+	FreeOneRTMesh(rtTrailMesh, rtTrailMat, rtTrailCap);
 }
 
 void ParticleEmitter::Update()
@@ -733,6 +779,9 @@ void ParticleEmitter::Advance(float dt)
 				se->BurstAt(Vector3(subBurstPts[k], subBurstPts[k + 1], subBurstPts[k + 2]), subEmitterCount);
 		subBurstPts.clear();
 	}
+
+	// Particle LIGHT source (one-frame submissions, consumed by World::Render's light pack).
+	SubmitLights();
 }
 
 // ---- rendering ----------------------------------------------------------------------------
@@ -767,6 +816,15 @@ void ParticleEmitter::OnRender(iRender* r, RenderPhase phase)
 			}
 		}
 	}
+	// RT gather (between beginRTScene/buildRTScene): contribute this frame's particle
+	// geometry — sprite quads, trail ribbons, mesh-mode instances — so reflections and
+	// shadow rays see the effect exactly as drawn.
+	if (phase == RenderPhase::RTScene)
+	{
+		if (r && r->rtAvailable() && (inReflections || castShadows) && transform)
+			BuildRTQuads(r);
+		return;
+	}
 	if (phase != RenderPhase::Transparent || !r) return;
 	// EDITOR preview: the sim advances from the render hook while NOT playing (PIE stopped /
 	// edit mode) — effects are alive in the viewport, like every big engine's scene view.
@@ -775,13 +833,12 @@ void ParticleEmitter::OnRender(iRender* r, RenderPhase phase)
 	Draw(r);
 }
 
-void ParticleEmitter::Draw(iRender* r)
+// HOT-APPLY asset resolution: re-resolve whenever the PROP changed (assign, replace,
+// reset-to-empty) — a latched first state was exactly the reported bug. Also retries a
+// not-yet-loaded asset (pak load order) because a failed resolve stores the guid only
+// on success. Shared by Draw() and BuildRTQuads() (whichever runs first this frame).
+void ParticleEmitter::ResolveAssets()
 {
-	if (parts.empty() || !transform) return;
-	// HOT-APPLY asset resolution: re-resolve whenever the PROP changed (assign, replace,
-	// reset-to-empty) — a latched first state was exactly the reported bug. Also retries a
-	// not-yet-loaded asset (pak load order) because a failed resolve stores the guid only
-	// on success.
 	if (textureGuid != texGuidRes)
 	{
 		texCache = textureGuid.empty() ? nullptr : ResDB::getSingleton()->GetTexture(textureGuid);
@@ -802,6 +859,12 @@ void ParticleEmitter::Draw(iRender* r)
 		trailTexCache = trailTextureGuid.empty() ? nullptr : ResDB::getSingleton()->GetTexture(trailTextureGuid);
 		if (trailTextureGuid.empty() || trailTexCache) trailTexGuidRes = trailTextureGuid;
 	}
+}
+
+void ParticleEmitter::Draw(iRender* r)
+{
+	if (parts.empty() || !transform) return;
+	ResolveAssets();
 
 	// The trail is an OPTION over any base mode (legacy renderMode 2 = billboard + trail).
 	const bool wantTrail = trailEnabled || renderMode == 2;
@@ -845,6 +908,8 @@ void ParticleEmitter::Draw(iRender* r)
 			for (int k = 0; k < 4; ++k) rec.row2[k] = w[k][2];
 			float rgb[3] = { (float)startColor.r, (float)startColor.g, (float)startColor.b };
 			EvalGradient(colorGradient, lt, rgb);
+			const float gEffM = glow * EvalCurve(glowOverLife, lt, 1.f);
+			if (gEffM > 0.f) { const float g = 1.f + gEffM; rgb[0] *= g; rgb[1] *= g; rgb[2] *= g; }   // HDR boost -> bloom
 			rec.color[0] = rgb[0]; rec.color[1] = rgb[1]; rec.color[2] = rgb[2];
 			rec.color[3] = (float)startColor.a * Clamp01(EvalCurve(alphaOverLife, lt, 1.f));
 			rec.custom[0] = lt; rec.custom[1] = p.seed;
@@ -892,6 +957,8 @@ void ParticleEmitter::Draw(iRender* r)
 			float col[4] = { (float)startColor.r, (float)startColor.g, (float)startColor.b,
 			                 (float)startColor.a * Clamp01(EvalCurve(alphaOverLife, lt, 1.f)) };
 			EvalGradient(colorGradient, lt, col);
+			const float gEffS = glow * EvalCurve(glowOverLife, lt, 1.f);   // emission breathes over life
+			if (gEffS > 0.f) { const float g = 1.f + gEffS; col[0] *= g; col[1] *= g; col[2] *= g; }   // HDR boost -> bloom
 			if (blend == 1) { col[0] *= col[3]; col[1] *= col[3]; col[2] *= col[3]; }   // additive: premodulate
 			glm::vec3 wp(p.pos[0], p.pos[1], p.pos[2]);
 			if (localSpace) wp = glm::vec3(l2w * glm::vec4(wp, 1));
@@ -930,6 +997,8 @@ void ParticleEmitter::Draw(iRender* r)
 			float col[4] = { (float)startColor.r, (float)startColor.g, (float)startColor.b,
 			                 (float)startColor.a * Clamp01(EvalCurve(alphaOverLife, lt, 1.f)) };
 			EvalGradient(colorGradient, lt, col);
+			const float gEffT = glow * EvalCurve(glowOverLife, lt, 1.f);
+			if (gEffT > 0.f) { const float g = 1.f + gEffT; col[0] *= g; col[1] *= g; col[2] *= g; }   // HDR boost -> bloom
 			const float* h = trailHist.data() + (size_t)oi * kTrailCap * 3;
 			const float headW = std::max(0.001f, sz * trailWidth * 0.5f);   // half-width at the head
 			for (int sgi = kTrailCap - segs; sgi < kTrailCap - 1; ++sgi)
@@ -971,6 +1040,306 @@ void ParticleEmitter::Draw(iRender* r)
 			r->drawSpriteRun(baseTex, verts.data(), (int)verts.size() / 9);
 		}
 		if (softFade > 0.f) r->setSpriteSoftDepth(0.f);   // restore: other sprite users stay hard
+	}
+}
+
+// RenderPhase::RTScene: refresh the per-frame RT geometry and register it in the TLAS so
+// ray-traced reflections and shadow rays see the particles EXACTLY as drawn:
+//  - billboard/stretched sprites -> a quad mesh (world-space verts + PER-VERTEX gradient/fade
+//    colors rewritten every frame; version bump -> in-place buffer update -> per-frame BLAS
+//    rebuild; the dead tail collapses to degenerate triangles);
+//  - trail ribbons -> a second quad mesh (real ribbon UVs, strip shadow footprint);
+//  - mesh-mode particles -> one TLAS instance per particle over the ASSET mesh (cached BLAS).
+// Faded particles (alpha < 0.02) drop out; the color pool carries the exact per-particle tint.
+void ParticleEmitter::BuildRTQuads(iRender* r)
+{
+	if (parts.empty()) return;   // no addRTInstance -> not in the TLAS this frame
+	ResolveAssets();
+	const bool wantTrail = trailEnabled || renderMode == 2;
+	const int  baseMode  = renderMode == 2 ? 0 : renderMode;
+
+	float view[16], proj[16];
+	r->getViewProj(view, proj);
+	glm::vec3 right(view[0], view[4], view[8]);
+	glm::vec3 up(view[1], view[5], view[9]);
+	glm::vec3 camF(view[2], view[6], view[10]);
+	glm::mat4 l2w(1.0f);
+	if (localSpace)
+	{
+		Vector3 cp = transform->globalPosition(); Quaternion Q = transform->globalRotation();
+		l2w = glm::translate(glm::mat4(1.f), glm::vec3((float)cp.x, (float)cp.y, (float)cp.z))
+		    * glm::mat4_cast(glm::quat((float)Q.w, (float)Q.x, (float)Q.y, (float)Q.z));
+	}
+	const int   cap = maxParticles < 1 ? 1 : maxParticles;
+	const int   n   = (int)parts.size() < cap ? (int)parts.size() : cap;
+	float alphaSum = 0.f; int alphaN = 0;
+
+	// ---- MESH mode: one TLAS instance per particle over the asset mesh (cached BLAS) ----
+	if (baseMode == 3 && meshCache)
+	{
+		for (int i = 0; i < n; ++i)
+		{
+			const P& p = parts[i];
+			float lt = 1.f - p.life / p.maxLife;
+			float a  = (float)startColor.a * Clamp01(EvalCurve(alphaOverLife, lt, 1.f));
+			if (a < 0.02f) continue;
+			float sz = p.size * EvalCurve(sizeOverLife, lt, 1.f);
+			glm::vec3 wp(p.pos[0], p.pos[1], p.pos[2]);
+			if (localSpace) wp = glm::vec3(l2w * glm::vec4(wp, 1));
+			glm::quat q = glm::angleAxis(p.rot, glm::normalize(glm::vec3(0.3f, 1, 0.2f)));
+			float pos[3]   = { wp.x, wp.y, wp.z };
+			float quat[4]  = { q.x, q.y, q.z, q.w };
+			float scale[3] = { sz, sz, sz };
+			r->addRTInstance(meshCache, matCache, pos, quat, scale, inReflections, castShadows);
+		}
+	}
+
+	// ---- SPRITE modes: the per-frame quad mesh (billboard or velocity-stretched) ----
+	if (baseMode != 3)
+	{
+		if (!rtMesh || rtCap != cap)
+		{
+			FreeOneRTMesh(rtMesh, rtMat, rtCap);
+			rtMesh = new Mesh();
+			rtCap  = cap;
+			strncpy(rtMesh->name, "particles_rt", sizeof(rtMesh->name) - 1);
+			rtMesh->numVerts     = cap * 6;
+			rtMesh->vertexArray  = new float[(size_t)cap * 18]();   // zeros = degenerate quads
+			rtMesh->normalArray  = new float[(size_t)cap * 18];
+			rtMesh->uvArray      = new float[(size_t)cap * 12];
+			rtMesh->rtColorArray = new float[(size_t)cap * 24]();   // float4 x 6 verts per quad
+			rtMesh->rtDynamic     = true;   // renderer rebuilds the BLAS every frame
+			rtMesh->rtAlphaTested = true;   // rays alpha-test texture x particle fade
+			// Canonical quad UVs -- registered ONCE in the RT concat buffers, never touched
+			// again (world.ps reconstructs the same UVs analytically for the footprint test).
+			static const float qu[12] = { 0,1, 1,1, 1,0, 0,1, 1,0, 0,0 };
+			for (int i = 0; i < cap; ++i) memcpy(rtMesh->uvArray + (size_t)i * 12, qu, sizeof(qu));
+			for (int i = 0; i < cap * 6; ++i)
+			{ rtMesh->normalArray[i * 3] = 0.f; rtMesh->normalArray[i * 3 + 1] = 0.f; rtMesh->normalArray[i * 3 + 2] = 1.f; }
+			std::cout << "[VFX]\t\tparticle RT quads active (cap " << cap << ")" << std::endl;
+		}
+		// stretched sprites shadow as their full quad; round billboards as a disc
+		rtMesh->rtShadowShape = (baseMode == 1) ? 0 : 1;
+
+		float* v  = rtMesh->vertexArray;
+		float* vc = rtMesh->rtColorArray;
+		int q = 0;
+		for (int i = 0; i < n; ++i)
+		{
+			const P& p = parts[i];
+			float lt = 1.f - p.life / p.maxLife;
+			float col[4] = { (float)startColor.r, (float)startColor.g, (float)startColor.b,
+			                 (float)startColor.a * Clamp01(EvalCurve(alphaOverLife, lt, 1.f)) };
+			EvalGradient(colorGradient, lt, col);
+			if (col[3] < 0.02f) continue;   // fully faded -> out of the TLAS
+			alphaSum += col[3]; ++alphaN;
+			float sz = p.size * EvalCurve(sizeOverLife, lt, 1.f);
+			glm::vec3 wp(p.pos[0], p.pos[1], p.pos[2]);
+			if (localSpace) wp = glm::vec3(l2w * glm::vec4(wp, 1));
+			glm::vec3 rv, uv2;
+			if (baseMode == 1)   // velocity-stretched (same math as Draw)
+			{
+				glm::vec3 vel(p.vel[0], p.vel[1], p.vel[2]);
+				float spd = glm::length(vel);
+				glm::vec3 axis = spd > 1e-4f ? vel / spd : up;
+				glm::vec3 side = glm::normalize(glm::cross(axis, camF) + glm::vec3(1e-5f));
+				rv = side * (sz * 0.5f); uv2 = axis * (sz * 0.5f + spd * stretch);
+			}
+			else                 // camera-facing billboard (rotated)
+			{
+				float cr = cosf(p.rot), sr = sinf(p.rot);
+				rv  = (right * cr + up * sr) * (sz * 0.5f);
+				uv2 = (up * cr - right * sr) * (sz * 0.5f);
+			}
+			const glm::vec3 v0 = wp - rv - uv2, v1 = wp + rv - uv2, v2 = wp + rv + uv2, v3 = wp - rv + uv2;
+			const glm::vec3 quad[6] = { v0, v1, v2, v0, v2, v3 };
+			float* dst = v + (size_t)q * 18;
+			for (int k = 0; k < 6; ++k) { dst[k * 3] = quad[k].x; dst[k * 3 + 1] = quad[k].y; dst[k * 3 + 2] = quad[k].z; }
+			// Per-particle glow rides IN the color pool (HDR floats) -- the reflection breathes
+			// with the same Glow Over Life curve as the direct view.
+			const float gB = 1.f + glow * EvalCurve(glowOverLife, lt, 1.f);
+			float* cdst = vc + (size_t)q * 24;
+			for (int k = 0; k < 6; ++k) { cdst[k * 4] = col[0] * gB; cdst[k * 4 + 1] = col[1] * gB; cdst[k * 4 + 2] = col[2] * gB; cdst[k * 4 + 3] = col[3]; }
+			++q;
+		}
+		memset(v  + (size_t)q * 18, 0, ((size_t)cap - q) * 18 * sizeof(float));
+		memset(vc + (size_t)q * 24, 0, ((size_t)cap - q) * 24 * sizeof(float));   // a=0 -> any-hit ignores
+		if (q > 0)
+		{
+			rtMesh->version++;
+			// Instance material: BLACK albedo, WHITE emissive x (1+glow) -- the per-vertex color
+			// pool carries the actual tint/fade, so the reflection matches the direct view; zero
+			// specular so nothing recurses off a particle. diff feeds the any-hit alpha test.
+			if (!rtMat) rtMat = new Material();
+			Texture* baseTex = texCache ? texCache : ShapeTex(spriteShape);
+			rtMat->diff  = baseTex;
+			rtMat->em    = baseTex;
+			rtMat->color = Color(0, 0, 0, alphaN ? (double)(alphaSum / alphaN) : 1.0);   // a = shadow gate
+			rtMat->metallic = 0.f; rtMat->roughness = 1.f; rtMat->specular = 0.f;
+			rtMat->emissive = Color(1, 1, 1, 1);
+			rtMat->emissiveIntensity = 1.0f;   // the glow boost is per-vertex (color pool)
+			float pos[3] = { 0, 0, 0 }, quat[4] = { 0, 0, 0, 1 }, scale[3] = { 1, 1, 1 };   // verts are world-space
+			r->addRTInstance(rtMesh, rtMat, pos, quat, scale, inReflections, castShadows);
+		}
+	}
+
+	// ---- TRAIL ribbons: a second quad mesh (real ribbon UVs, strip shadow footprint) ----
+	if (wantTrail && trailHist.size() == parts.size() * (size_t)kTrailCap * 3)
+	{
+		const int segs = trailSegments < 2 ? 2 : (trailSegments > kTrailCap ? kTrailCap : trailSegments);
+		const int quadsPer = segs - 1;
+		const int tcap = cap * quadsPer;
+		if (!rtTrailMesh || rtTrailCap != tcap)
+		{
+			FreeOneRTMesh(rtTrailMesh, rtTrailMat, rtTrailCap);
+			rtTrailMesh = new Mesh();
+			rtTrailCap  = tcap;
+			strncpy(rtTrailMesh->name, "particles_trail_rt", sizeof(rtTrailMesh->name) - 1);
+			rtTrailMesh->numVerts     = tcap * 6;
+			rtTrailMesh->vertexArray  = new float[(size_t)tcap * 18]();
+			rtTrailMesh->normalArray  = new float[(size_t)tcap * 18];
+			rtTrailMesh->uvArray      = new float[(size_t)tcap * 12];
+			rtTrailMesh->rtColorArray = new float[(size_t)tcap * 24]();
+			rtTrailMesh->rtDynamic     = true;
+			rtTrailMesh->rtAlphaTested = true;
+			rtTrailMesh->rtShadowShape = 2;   // ribbon: strip across u
+			for (int i = 0; i < tcap * 6; ++i)
+			{ rtTrailMesh->normalArray[i * 3] = 0.f; rtTrailMesh->normalArray[i * 3 + 1] = 0.f; rtTrailMesh->normalArray[i * 3 + 2] = 1.f; }
+			// Ribbon UVs are FIXED per quad slot (u across, v head->tail by segment index) --
+			// written once, valid forever (the concat UV registration is one-shot).
+			for (int qi = 0; qi < tcap; ++qi)
+			{
+				const int sgi = qi % quadsPer;                                  // segment within the ribbon
+				const float vA = (float)(quadsPer - sgi)     / (float)quadsPer; // alongA (older end)
+				const float vB = (float)(quadsPer - sgi - 1) / (float)quadsPer; // alongB (newer end)
+				float* u = rtTrailMesh->uvArray + (size_t)qi * 12;
+				u[0]=0; u[1]=vA;  u[2]=1; u[3]=vA;  u[4]=1; u[5]=vB;
+				u[6]=0; u[7]=vA;  u[8]=1; u[9]=vB;  u[10]=0; u[11]=vB;
+			}
+		}
+		float* tv  = rtTrailMesh->vertexArray;
+		float* tvc = rtTrailMesh->rtColorArray;
+		int tq = 0;
+		for (int i = 0; i < n; ++i)
+		{
+			const P& p = parts[i];
+			float lt = 1.f - p.life / p.maxLife;
+			float sz = p.size * EvalCurve(sizeOverLife, lt, 1.f);
+			float col[4] = { (float)startColor.r, (float)startColor.g, (float)startColor.b,
+			                 (float)startColor.a * Clamp01(EvalCurve(alphaOverLife, lt, 1.f)) };
+			EvalGradient(colorGradient, lt, col);
+			if (col[3] < 0.02f) continue;
+			const float* h = trailHist.data() + (size_t)i * kTrailCap * 3;
+			const float headW = (sz * trailWidth * 0.5f) < 0.001f ? 0.001f : (sz * trailWidth * 0.5f);
+			for (int sgi = kTrailCap - segs; sgi < kTrailCap - 1 && tq < tcap; ++sgi)
+			{
+				glm::vec3 a(h[sgi * 3], h[sgi * 3 + 1], h[sgi * 3 + 2]);
+				glm::vec3 b(h[(sgi + 1) * 3], h[(sgi + 1) * 3 + 1], h[(sgi + 1) * 3 + 2]);
+				if (localSpace) { a = glm::vec3(l2w * glm::vec4(a, 1)); b = glm::vec3(l2w * glm::vec4(b, 1)); }
+				glm::vec3 d = b - a;
+				float* dst  = tv  + (size_t)tq * 18;
+				float* cdst = tvc + (size_t)tq * 24;
+				if (glm::dot(d, d) < 1e-10f) { memset(dst, 0, 18 * sizeof(float)); memset(cdst, 0, 24 * sizeof(float)); ++tq; continue; }
+				glm::vec3 side = glm::normalize(glm::cross(glm::normalize(d), camF) + glm::vec3(1e-6f));
+				const float alongA = (float)(kTrailCap - 1 - sgi) / (float)(segs - 1);
+				const float alongB = (float)(kTrailCap - 2 - sgi) / (float)(segs - 1);
+				const float wA = headW * (1.f - trailTaper * alongA);
+				const float wB = headW * (1.f - trailTaper * alongB);
+				const float aA = col[3] * (1.f - trailFade * alongA);
+				const float aB = col[3] * (1.f - trailFade * alongB);
+				glm::vec3 s0 = side * wA, s1 = side * wB;
+				const glm::vec3 q0 = a - s0, q1 = a + s0, q2 = b + s1, q3 = b - s1;
+				const glm::vec3 quad[6] = { q0, q1, q2, q0, q2, q3 };
+				const float av[6] = { aA, aA, aB, aA, aB, aB };
+				const float gB = 1.f + glow * EvalCurve(glowOverLife, lt, 1.f);
+				for (int k = 0; k < 6; ++k)
+				{
+					dst[k * 3] = quad[k].x; dst[k * 3 + 1] = quad[k].y; dst[k * 3 + 2] = quad[k].z;
+					cdst[k * 4] = col[0] * gB; cdst[k * 4 + 1] = col[1] * gB; cdst[k * 4 + 2] = col[2] * gB; cdst[k * 4 + 3] = av[k];
+				}
+				++tq;
+			}
+		}
+		memset(tv  + (size_t)tq * 18, 0, ((size_t)tcap - tq) * 18 * sizeof(float));
+		memset(tvc + (size_t)tq * 24, 0, ((size_t)tcap - tq) * 24 * sizeof(float));
+		if (tq > 0)
+		{
+			rtTrailMesh->version++;
+			if (!rtTrailMat) rtTrailMat = new Material();
+			rtTrailMat->diff  = trailTexCache;   // null = plain ribbon (any-hit passes on fade only)
+			rtTrailMat->em    = trailTexCache;
+			rtTrailMat->color = Color(0, 0, 0, alphaN ? (double)(alphaSum / alphaN) : 1.0);
+			rtTrailMat->metallic = 0.f; rtTrailMat->roughness = 1.f; rtTrailMat->specular = 0.f;
+			rtTrailMat->emissive = Color(1, 1, 1, 1);
+			rtTrailMat->emissiveIntensity = 1.0f;   // glow boost is per-vertex (color pool)
+			float pos[3] = { 0, 0, 0 }, quat[4] = { 0, 0, 0, 1 }, scale[3] = { 1, 1, 1 };
+			r->addRTInstance(rtTrailMesh, rtTrailMat, pos, quat, scale, inReflections, castShadows);
+		}
+	}
+}
+
+// End of Advance: publish this frame's particle LIGHT(s). lightCount == 1 -> one aggregated
+// point light at the alpha-weighted centroid (cheap, stable); N -> the N biggest particles
+// each carry a light. Color = weighted particle color x (1 + glow). One-frame submissions.
+void ParticleEmitter::SubmitLights()
+{
+	if (lightIntensity <= 0.f || parts.empty()) return;
+	glm::mat4 l2w(1.0f);
+	if (localSpace && transform)
+	{
+		Vector3 cp = transform->globalPosition(); Quaternion Q = transform->globalRotation();
+		l2w = glm::translate(glm::mat4(1.f), glm::vec3((float)cp.x, (float)cp.y, (float)cp.z))
+		    * glm::mat4_cast(glm::quat((float)Q.w, (float)Q.x, (float)Q.y, (float)Q.z));
+	}
+	const float gI = 1.f + (glow > 0.f ? glow : 0.f);
+	// Per-particle light SCALE m: Glow Over Life always breathes the light; Bind Light To
+	// Alpha additionally fades it with the particle's alpha -- no popping in/out.
+	struct LP { float w; float m; glm::vec3 p; float c[3]; };
+	static std::vector<LP> lps; lps.clear();
+	for (const P& p : parts)
+	{
+		float lt = 1.f - p.life / p.maxLife;
+		float col[4] = { (float)startColor.r, (float)startColor.g, (float)startColor.b,
+		                 (float)startColor.a * Clamp01(EvalCurve(alphaOverLife, lt, 1.f)) };
+		EvalGradient(colorGradient, lt, col);
+		float m = EvalCurve(glowOverLife, lt, 1.f);
+		if (lightBindAlpha) m *= Clamp01(col[3]);
+		if (m < 0.005f || col[3] < 0.005f) continue;   // fully faded out
+		float sz = p.size * EvalCurve(sizeOverLife, lt, 1.f);
+		glm::vec3 wp(p.pos[0], p.pos[1], p.pos[2]);
+		if (localSpace) wp = glm::vec3(l2w * glm::vec4(wp, 1));
+		lps.push_back({ col[3] * sz, m, wp, { col[0], col[1], col[2] } });
+	}
+	if (lps.empty()) return;
+	auto submit = [&](const glm::vec3& pos, const float c[3], float m)
+	{
+		NukeLight nl; nl.type = 1;   // point
+		nl.pos[0] = pos.x; nl.pos[1] = pos.y; nl.pos[2] = pos.z;
+		nl.color[0] = c[0] * gI; nl.color[1] = c[1] * gI; nl.color[2] = c[2] * gI;
+		nl.intensity = lightIntensity * m; nl.range = lightRadius; nl.castShadows = 0;
+		FrameLights::Submit(nl);
+	};
+	if (lightCount <= 0)
+	{
+		// EVERY particle is a light (UE-style). Shadowless point lights are cheap in the
+		// shader (range early-out, no shadow rays); the renderer clamps the combined world
+		// set at its 256-light budget.
+		for (const LP& l : lps) submit(l.p, l.c, l.m);
+	}
+	else if (lightCount == 1)
+	{
+		glm::vec3 cpos(0); float cw = 0, cm = 0; float cc[3] = { 0, 0, 0 };
+		for (const LP& l : lps) { cpos += l.p * l.w; cw += l.w; cm += l.m * l.w; cc[0] += l.c[0] * l.w; cc[1] += l.c[1] * l.w; cc[2] += l.c[2] * l.w; }
+		if (cw <= 0.f) return;
+		cpos /= cw; float c[3] = { cc[0] / cw, cc[1] / cw, cc[2] / cw };
+		submit(cpos, c, cm / cw);
+	}
+	else
+	{
+		const int want = lightCount > 256 ? 256 : lightCount;
+		const int take = (int)lps.size() < want ? (int)lps.size() : want;
+		std::partial_sort(lps.begin(), lps.begin() + take, lps.end(), [](const LP& a, const LP& b) { return a.w * a.m > b.w * b.m; });
+		for (int i = 0; i < take; ++i) submit(lps[i].p, lps[i].c, lps[i].m);
 	}
 }
 

@@ -27,7 +27,7 @@ namespace nuke {
 // inside a sphere. Additive; lives on any atom, moves with it.
 class NUKEVFX_API ForceField : public Component
 {
-	NUKE_CLASS(ForceField, Component)
+	NUKE_CLASS(ForceField, Component, "Effects")
 public:
 	[[nuke::prop(label="Mode", enum="Attract,Repel,Vortex,Turbulence")]] int mode = 1;
 	[[nuke::prop(label="Radius", min=0)]]    float radius = 5.0f;
@@ -41,7 +41,9 @@ public:
 	void FixedUpdate() override;
 	void Pause() override;
 	void Reset() override;
-	void OnRender(iRender* r, RenderPhase phase) override;   // selected-field gizmo (editor)
+	void OnRender(iRender* r, RenderPhase phase) override;   // selected-field gizmo + bend-volume submit
+
+	unsigned long long bendSubmitFrame = ~0ull;   // once-per-frame guard (OnRender runs per pass)
 };
 
 // THE emitter. Curves are flattened (t,value) pair arrays over normalized life 0..1; the
@@ -49,7 +51,7 @@ public:
 // serialized, moddable.
 class NUKEVFX_API ParticleEmitter : public Component
 {
-	NUKE_CLASS(ParticleEmitter, Component)
+	NUKE_CLASS(ParticleEmitter, Component, "Effects")
 public:
 	// ---- emission --------------------------------------------------------------------------
 	[[nuke::prop(label="Playing")]]                     bool  playing = true;
@@ -115,6 +117,15 @@ public:
 	[[nuke::prop(label="Trail Fade", min=0, max=1, tip="How much the ribbon fades out toward the tail.")]] float trailFade = 1.0f;
 	[[nuke::prop(asset="texture", label="Trail Texture", tip="Stretched ALONG the whole ribbon (u across, v head->tail). Empty = plain ribbon.")]] std::string trailTextureGuid;
 	[[nuke::prop(label="Soft Fade", min=0, tip="Soft particles: fade within this distance of scene geometry (needs a depth prepass - TAA/SSR/decals on the camera). 0 = off.")]] float softFade = 0.0f;
+	// ---- lighting / ray tracing ------------------------------------------------------------
+	[[nuke::prop(label="Glow", min=0, tip="HDR emissive boost: particle color is multiplied by (1 + glow), so bloom picks it up and reflected particles glow too. 0 = off.")]] float glow = 0.0f;
+	[[nuke::prop(label="Glow Over Life", widget="curve", min=0, tip="Multiplier of Glow (and of the particle light) over the particle's life — emission breathes in and out instead of popping.")]] std::vector<float> glowOverLife;   // keys (t,v,inTan,outTan)
+	[[nuke::prop(label="In Reflections", tip="Ray-traced reflections show the particles (alpha-tested, per-particle color and fade).")]] bool inReflections = true;
+	[[nuke::prop(label="Cast Shadows", tip="Particles occlude ray-traced light (sprites shadow as discs, stretched as quads, trails as ribbons). Raster shadow maps are unaffected.")]] bool castShadows = false;
+	[[nuke::prop(label="Light", min=0, tip="Particles LIGHT THE SCENE: intensity of the emitted point light(s), 0 = off. Color follows the current particle color x (1 + glow).")]] float lightIntensity = 0.0f;
+	[[nuke::prop(label="Light Radius", min=0.1)]] float lightRadius = 6.0f;
+	[[nuke::prop(label="Light Particles", min=0, max=256, tip="0 = EVERY particle carries its own light (UE-style); 1 = one aggregated light at the cloud's center; N = the N biggest particles. The engine budget is 256 lights per world (extras are dropped).")]] int lightCount = 0;
+	[[nuke::prop(label="Bind Light To Alpha", tip="The particle's alpha directly scales its light — fading particles dim smoothly instead of switching off. Glow Over Life scales the light too, always.")]] bool lightBindAlpha = true;
 	// ---- sub-emitter -----------------------------------------------------------------------
 	[[nuke::prop(label="Sub Emitter", tip="Another atom's ParticleEmitter: burst there when a particle dies/collides.")]] Atom* subEmitter = nullptr;
 	[[nuke::prop(label="Sub Emitter Count", min=0)]]    int subEmitterCount = 5;
@@ -143,6 +154,16 @@ public:
 	Texture* texCache = nullptr; Mesh* meshCache = nullptr; Material* matCache = nullptr;
 	Texture* trailTexCache = nullptr;
 	std::string texGuidRes, meshGuidRes, matGuidRes, trailTexGuidRes;
+	// RT quad meshes (reflections/shadow rays): sprite quads + trail ribbons, verts AND
+	// per-vertex colors (gradient/fade) rewritten every frame in world space; dead space =
+	// degenerate triangles. Owned materials carry the textures + emissive(glow) into the
+	// TLAS instance data; their color.a = average alive alpha (shadow gate).
+	Mesh*     rtMesh = nullptr;      Material* rtMat = nullptr;      int rtCap = 0;
+	Mesh*     rtTrailMesh = nullptr; Material* rtTrailMat = nullptr; int rtTrailCap = 0;
+	void ResolveAssets();               // guid -> cache hot-apply (shared by Draw and the RT build)
+	void BuildRTQuads(iRender* r);      // RenderPhase::RTScene: refresh quads/trails/mesh instances
+	void SubmitLights();                // end of Advance: publish this frame's particle light(s)
+	void FreeRTMesh();                  // invalidateMesh + delete (component teardown / capacity change)
 	int rayCursor = 0;                   // editor-preview scene raycasts: round-robin budget start
 	double pendingSubBursts = 0;         // deaths this frame -> sub-emitter bursts (applied on game thread)
 	std::vector<float> subBurstPts;      // xyz per pending burst
