@@ -9,6 +9,8 @@
 #include <API/Model/DebugDraw.h>
 #include <API/Model/Light.h>          // FrameLights: glowing particles light the scene
 #include <API/Model/BendVolumes.h>    // force fields bend foliage too (7.4)
+#include <interface/Services.h>       // iWaterQuery: rain drops splash rings on water (7.5)
+#include <service/iWaterQuery.h>
 #include <API/Model/MeshRenderer.h>   // Surface collision + editor-preview scene rays
 #include <API/Model/Events.h>         // vfx.collision events (point/normal/atom/uv)
 #include <API/Model/World.h>          // editor-preview World-mode collision scans the scene
@@ -686,6 +688,7 @@ void ParticleEmitter::Advance(float dt)
 	// frames) and the ray REACH is stretched by K so skipped frames cannot tunnel.
 	AppInstance* colApp = AppInstance::GetSingleton();
 	const bool editorPreview = colApp->isEditor() && colApp->playState == 0;
+	iWaterQuery* wq = waterContact ? GetService<iWaterQuery>() : nullptr;   // rain -> rings
 	int eventsDone = 0;
 	const int alive = (int)parts.size();
 	const int budget = collisionBudget <= 0 ? alive : collisionBudget;
@@ -751,6 +754,22 @@ void ParticleEmitter::Advance(float dt)
 			}
 			if (collided && dieOnCollision) dead = true;
 			if (collided && subOnCollision && subEmitter) subBurstPts.insert(subBurstPts.end(), { hitP.x, hitP.y, hitP.z });
+		}
+		// Water contact (7.5 stage 3): a particle crossing the water surface splashes small
+		// sharp rings exactly where it lands (the water module's service) and, for rain,
+		// dies right there.
+		if (!dead && wq)
+		{
+			glm::vec3 wp2(p.pos[0], p.pos[1], p.pos[2]);
+			if (localSpace) wp2 = glm::vec3(l2w * glm::vec4(wp2, 1));
+			const double lvl = wq->HeightAt(wp2.x, wp2.z);
+			if (lvl > -1e8 && wp2.y <= (float)lvl)
+			{
+				const float hp3[3] = { wp2.x, (float)lvl, wp2.z };
+				wq->Splash(hp3, p.size * 0.9f + 0.12f, 0.15f + fabsf(p.vel[1]) * 0.05f);
+				if (dieOnWater) dead = true;
+				else p.vel[1] = fabsf(p.vel[1]) * 0.25f;   // damped pop back out
+			}
 		}
 		if (dead)
 		{

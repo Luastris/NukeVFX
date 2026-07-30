@@ -90,6 +90,10 @@ public:
 	[[nuke::prop(label="Bounce", min=0, max=1)]]        float bounce = 0.3f;
 	[[nuke::prop(label="Collision Dampen", min=0, max=1)]] float collideDampen = 0.2f;
 	[[nuke::prop(label="Die On Collision")]]            bool  dieOnCollision = false;
+	// Water (7.5 stage 3): particles crossing a WATER surface splash rings exactly where
+	// they land, through the water module's query service — rain over water just works.
+	[[nuke::prop(label="Water Contact", tip="Particles hitting a water surface splash rings where they land (needs NukeWater loaded).")]] bool waterContact = false;
+	[[nuke::prop(label="Die On Water", tip="Water Contact: remove the particle at the surface (off = a damped bounce).")]] bool dieOnWater = true;
 	[[nuke::prop(label="Collision Events", tip="Emit 'vfx.collision' per hit: point, normal, hit atom, uv (json payload).")]] bool collisionEvents = false;
 	[[nuke::prop(label="Collision Budget", min=0, tip="Max collision rays per frame; particles take turns and the ray reach stretches over skipped frames, so nothing tunnels. 0 = every particle every frame.")]] int collisionBudget = 512;
 	// ---- over-lifetime ---------------------------------------------------------------------
