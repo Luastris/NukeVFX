@@ -9,7 +9,7 @@
 #include <API/Model/DebugDraw.h>
 #include <API/Model/Light.h>          // FrameLights: glowing particles light the scene
 #include <API/Model/BendVolumes.h>    // force fields bend foliage too (7.4)
-#include <interface/Services.h>       // iWaterQuery: rain drops splash rings on water (7.5)
+#include <interface/Services.h>       // iWaterQuery: rain drops splash rings on water
 #include <service/iWaterQuery.h>
 #include <API/Model/MeshRenderer.h>   // Surface collision + editor-preview scene rays
 #include <API/Model/Events.h>         // vfx.collision events (point/normal/atom/uv)
@@ -28,7 +28,7 @@ using namespace nuke;
 
 namespace nuke {
 
-// ---- ForceField registry (mirrors WindZone's pattern) -------------------------------------
+// ---- ForceField registry -------------------------------------------------------------------
 static boost::mutex gFFLock;
 static std::vector<ForceField*> gFields;
 
@@ -45,9 +45,8 @@ void ForceField::Destroy()
 	boost::mutex::scoped_lock l(gFFLock);
 	gFields.erase(std::remove(gFields.begin(), gFields.end(), this), gFields.end());
 }
-// Selected-field gizmo (editor) + the field's FOLIAGE side: every enabled field submits
-// itself as an engine BendVolume once per frame, so grass bends in force fields exactly
-// like particles do (Attract pulls in, Repel pushes out, Vortex swirls, Turbulence jitters).
+// Submits the field as an engine BendVolume (so foliage bends too) and draws the selected
+// field's gizmo in the editor.
 void ForceField::OnRender(iRender*, RenderPhase phase)
 {
 	if (phase != RenderPhase::Overlay || !transform) return;
@@ -86,8 +85,7 @@ void ForceField::FixedUpdate() {}
 void ForceField::Pause() {}
 void ForceField::Reset() {}
 
-// Acceleration from every enabled ForceField at `p` (called from sim jobs — registry locked
-// once per frame by the caller which snapshots the fields).
+// Snapshot of the enabled fields, taken once per frame so the sim jobs never touch the registry.
 struct FFSnap { int mode; float center[3]; float radius; float strength; float falloff; };
 static void SnapFields(std::vector<FFSnap>& out)
 {
@@ -102,6 +100,7 @@ static void SnapFields(std::vector<FFSnap>& out)
 		out.push_back(s);
 	}
 }
+// Summed acceleration from every snapshotted field at world point `p`.
 static glm::vec3 FieldAccel(const std::vector<FFSnap>& fs, const glm::vec3& p, float seed, float t)
 {
 	glm::vec3 a(0);
@@ -130,14 +129,10 @@ static glm::vec3 FieldAccel(const std::vector<FFSnap>& fs, const glm::vec3& p, f
 }
 
 // ---- curve/gradient evaluation (flattened key/stop arrays) --------------------------------
-// Curve keys are stride-4: (t, value, inTangent, outTangent) — tangents are SLOPES dv/dt,
-// user-editable in the inspector (Bezier handles). Each segment is a cubic Hermite driven by
-// key[i].outTangent and key[i+1].inTangent, i.e. a full Bezier the user shapes per key.
-// Legacy (t,v)-pair arrays (odd stride) are upgraded in place by MigrateCurve at sim start.
-// Alpha is a COVERAGE multiplier — clamp its curve to 0..1 at every use. A poisoned key
-// (a runaway editor drag once wrote millions) would otherwise make even alpha~0 background
-// texels fully opaque: dark squares around every textured particle, immune to any mip fix.
+// Curve keys are stride-4: (t, value, inTangent, outTangent); tangents are slopes dv/dt and
+// each segment is a cubic Hermite. Alpha is a coverage multiplier — always Clamp01 its result.
 static float Clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
+// Evaluates a stride-4 curve at t, or `def` when the curve is empty.
 static float EvalCurve(const std::vector<float>& c, float t, float def)
 {
 	const size_t n = c.size() / 4;
@@ -155,11 +150,8 @@ static float EvalCurve(const std::vector<float>& c, float t, float def)
 	const float x = (t - t0) / h, x2 = x * x, x3 = x2 * x;
 	return (2 * x3 - 3 * x2 + 1) * v0 + (x3 - 2 * x2 + x) * m0 + (-2 * x3 + 3 * x2) * v1 + (x3 - x2) * m1;
 }
-// Upgrade a legacy (t,v)-pair curve to stride-4 keys with smooth Catmull-Rom auto tangents
-// (fires when the size is NOT a multiple of 4 — an unambiguous legacy layout), then enforce
-// keys ascending by t: EvalCurve's segment search assumes sorted keys, and a world saved
-// while the editor held an unsorted array would otherwise evaluate garbage (constant alpha
-// until death was exactly that).
+// Upgrades a legacy (t,v)-pair curve (size not a multiple of 4) to stride-4 keys with auto
+// tangents, then sorts keys ascending by t — EvalCurve's segment search requires that.
 static void MigrateCurve(std::vector<float>& c)
 {
 	if (!c.empty() && c.size() % 4 != 0 && c.size() % 2 == 0)
@@ -183,6 +175,7 @@ static void MigrateCurve(std::vector<float>& c)
 		for (size_t j = k; j >= 4 && c[j] < c[j - 4]; j -= 4)
 			for (int q = 0; q < 4; ++q) std::swap(c[j + q], c[j - 4 + q]);
 }
+// Evaluates a flattened (t,r,g,b) stop list at t into out[3]; leaves out untouched when empty.
 static void EvalGradient(const std::vector<float>& g, float t, float out[3])
 {
 	const size_t n = g.size() / 4;
@@ -202,9 +195,8 @@ static void EvalGradient(const std::vector<float>& g, float t, float out[3])
 }
 
 // ---- built-in particle shapes -------------------------------------------------------------
-// Procedural white RGBA textures (alpha = the shape) so particles are NOT stuck as squares
-// when no texture asset is assigned. Generated once per process; the renderer uploads them
-// like any Texture (SRV keyed by pointer). Quad (0) returns null = the white 1x1 fallback.
+// Procedural white RGBA texture (alpha = the shape) for the built-in sprite shapes, cached per
+// process. Shape 0 (Quad) returns null = the white 1x1 fallback.
 static Texture* ShapeTex(int shape)
 {
 	if (shape <= 0 || shape > 5) return nullptr;
@@ -260,10 +252,10 @@ static Texture* ShapeTex(int shape)
 }
 
 // ---- exact ray vs meshes (collision Surface/editor-preview World) -------------------------
-// Möller–Trumbore over the unindexed triangle list IN THE ATOM'S LOCAL SPACE (honest under
-// any transform), AABB slab early-out. Yields point/normal/UV — the event payload.
 struct VfxRayHit { float t; glm::vec3 point, normal; float u, v; Atom* atom; };
 
+// Möller–Trumbore over the mesh's unindexed triangles in LOCAL space (AABB slab early-out);
+// fills point/normal/UV and returns whether anything was hit within maxT.
 static bool RayMesh(Mesh* m, const glm::vec3& ro, const glm::vec3& rd, float maxT, VfxRayHit& out)
 {
 	if (!m || !m->vertexArray || m->numVerts < 3) return false;
@@ -356,14 +348,13 @@ static bool RayAtomSubtree(Atom* root, const glm::vec3& ro, const glm::vec3& rd,
 }
 
 // ---- editor-preview scene snapshot --------------------------------------------------------
-// The World collision mode outside play raycasts the scene MESHES. Walking the hierarchy and
-// inverting transforms PER RAY is a frame-rate hole (reported 10x drop in a mesh-heavy
-// world) — so the scene is snapshotted ONCE PER FRAME (Time::frame stamp, shared by every
-// emitter): cached inverse matrices + world-space AABBs for a cheap pre-test per ray.
+// Outside play there are no physics bodies, so World collision raycasts scene meshes against
+// this snapshot: cached inverse matrices + world AABBs, rebuilt once per frame (Time::frame).
 struct SceneEntry { Atom* atom; Mesh* mesh; glm::mat4 w, inv; glm::vec3 mn, mx; };
 static std::vector<SceneEntry> gScene;
 static unsigned long long gSceneStamp = ~0ull;
 
+// Rebuilds gScene for the current frame (no-op if already stamped).
 static void SnapScene()
 {
 	const unsigned long long f = Time::getSingleton()->frame;
@@ -436,12 +427,12 @@ static bool RayScene(const glm::vec3& ro, const glm::vec3& rd, float maxT, VfxRa
 }
 
 // ---- collision events ---------------------------------------------------------------------
-// "vfx.collision" on the engine bus, JSON payload: emitter/hit atom names + ids, world point,
-// surface normal, and UV at the hit when the mesh has one (physics hits carry u=v=-1).
 static void JsonEsc(std::string& s, const std::string& in)
 {
 	for (char ch : in) { if (ch == '"' || ch == '\\') s += '\\'; s += ch; }
 }
+// Emits "vfx.collision" on the engine bus: emitter/hit atom names + ids, world point, normal
+// and hit UV (physics hits carry u=v=-1).
 static void EmitCollisionEvent(Atom* emitterAtom, const glm::vec3& pt, const glm::vec3& n, Atom* hitAtom, float u, float v)
 {
 	std::string j = "{\"emitter\":\"";
@@ -474,9 +465,8 @@ void ParticleEmitter::Destroy()
 	FreeRTMesh();
 }
 
-// Release the RT meshes: the renderer's caches (vertex buffers, BLAS, concatenated-buffer
-// offsets) key on the Mesh pointer — invalidate BEFORE delete or a rebuilt TLAS dereferences
-// freed memory (the InstancedMesh RT-chunk rule).
+// Frees one RT mesh + material. The renderer's caches key on the Mesh pointer: invalidateMesh
+// MUST happen before delete, or a rebuilt TLAS dereferences freed memory.
 static void FreeOneRTMesh(Mesh*& m, Material*& mat, int& cap)
 {
 	if (m)
@@ -496,8 +486,7 @@ void ParticleEmitter::FreeRTMesh()
 
 void ParticleEmitter::Update()
 {
-	// Sim in PLAY: scaled game delta (freezes at timescale 0, like the rest of gameplay).
-	Advance((float)Time::getSingleton()->gameDelta);
+	Advance((float)Time::getSingleton()->gameDelta);   // scaled delta: freezes at timescale 0
 }
 void ParticleEmitter::FixedUpdate() {}
 void ParticleEmitter::Pause() {}
@@ -622,8 +611,7 @@ void ParticleEmitter::Advance(float dt)
 	Vector3 cp = transform->globalPosition();
 	lastPos[0] = cp.x; lastPos[1] = cp.y; lastPos[2] = cp.z; hasLastPos = true;
 
-	// A live maxParticles REDUCTION applies immediately (oldest overflow dies) — every
-	// inspector edit must take effect now, never "after the old ones drain".
+	// A live maxParticles reduction applies immediately (overflow dies now).
 	if ((int)parts.size() > maxParticles && maxParticles > 0)
 	{
 		parts.resize(maxParticles);
@@ -638,9 +626,7 @@ void ParticleEmitter::Advance(float dt)
 	const float windI = windInfluence;
 	const float dragK = drag;
 	const float t = ageSec;
-	// Wind::Sample includes zones (mutex) — snapshot ONE global wind for the batch; zones
-	// still contribute per-particle through Sample only when wind influence is on and the
-	// count is low; для массы частиц хватает глобального + турбулентности форс-полей.
+	// Wind::Sample locks the zone registry — sample ONCE and reuse for the whole batch.
 	Vector3 wv = windI > 0.f ? Wind::Sample(Vector3(cp.x, cp.y, cp.z)) : Vector3(0, 0, 0);
 	glm::vec3 wind((float)wv.x, (float)wv.y, (float)wv.z);
 	std::vector<P>& ps = parts;
@@ -679,13 +665,8 @@ void ParticleEmitter::Advance(float dt)
 		Quaternion Q = transform->globalRotation();
 		l2w = glm::translate(glm::mat4(1.f), glm::vec3((float)cp.x, (float)cp.y, (float)cp.z)) * glm::mat4_cast(glm::quat((float)Q.w, (float)Q.x, (float)Q.y, (float)Q.z));
 	}
-	// Collision setup: honest surfaces only. In PLAY, World mode uses physics rays; in the
-	// editor preview no bodies exist, so World mode raycasts the frame's scene-mesh snapshot.
-	// Surface mode always ray-tests the referenced atom's meshes — exact triangles, which is
-	// also where the hit UV comes from.
-	// BUDGET (perf): a ray per particle per frame was a 10x frame-rate hole on dense
-	// emitters. collisionBudget caps rays/frame; particles take turns (round-robin over K
-	// frames) and the ray REACH is stretched by K so skipped frames cannot tunnel.
+	// Ray budget: particles take turns round-robin over K frames and the ray reach is stretched
+	// by K, so skipped frames cannot tunnel.
 	AppInstance* colApp = AppInstance::GetSingleton();
 	const bool editorPreview = colApp->isEditor() && colApp->playState == 0;
 	iWaterQuery* wq = waterContact ? GetService<iWaterQuery>() : nullptr;   // rain -> rings
@@ -755,9 +736,6 @@ void ParticleEmitter::Advance(float dt)
 			if (collided && dieOnCollision) dead = true;
 			if (collided && subOnCollision && subEmitter) subBurstPts.insert(subBurstPts.end(), { hitP.x, hitP.y, hitP.z });
 		}
-		// Water contact (7.5 stage 3): a particle crossing the water surface splashes small
-		// sharp rings exactly where it lands (the water module's service) and, for rain,
-		// dies right there.
 		if (!dead && wq)
 		{
 			glm::vec3 wp2(p.pos[0], p.pos[1], p.pos[2]);
@@ -799,17 +777,14 @@ void ParticleEmitter::Advance(float dt)
 		subBurstPts.clear();
 	}
 
-	// Particle LIGHT source (one-frame submissions, consumed by World::Render's light pack).
-	SubmitLights();
+	SubmitLights();   // one-frame submissions, consumed by World::Render's light pack
 }
 
 // ---- rendering ----------------------------------------------------------------------------
 
 void ParticleEmitter::OnRender(iRender* r, RenderPhase phase)
 {
-	// Selected-emitter gizmo (editor): the EMISSION SHAPE as wire geometry — the same
-	// affordance colliders/lights have. The viewport icon (editor-side) makes the atom
-	// clickable; this shows what the click selected.
+	// Selected-emitter gizmo (editor): the emission shape as wire geometry.
 	if (phase == RenderPhase::Overlay && transform)
 	{
 		AppInstance* gApp = AppInstance::GetSingleton();
@@ -835,9 +810,7 @@ void ParticleEmitter::OnRender(iRender* r, RenderPhase phase)
 			}
 		}
 	}
-	// RT gather (between beginRTScene/buildRTScene): contribute this frame's particle
-	// geometry — sprite quads, trail ribbons, mesh-mode instances — so reflections and
-	// shadow rays see the effect exactly as drawn.
+	// RT gather: must run between beginRTScene/buildRTScene.
 	if (phase == RenderPhase::RTScene)
 	{
 		if (r && r->rtAvailable() && (inReflections || castShadows) && transform)
@@ -845,17 +818,14 @@ void ParticleEmitter::OnRender(iRender* r, RenderPhase phase)
 		return;
 	}
 	if (phase != RenderPhase::Transparent || !r) return;
-	// EDITOR preview: the sim advances from the render hook while NOT playing (PIE stopped /
-	// edit mode) — effects are alive in the viewport, like every big engine's scene view.
+	// Editor preview: while not playing the sim advances from the render hook instead of Update.
 	AppInstance* app = AppInstance::GetSingleton();
 	if (app->playState == 0) Advance((float)Time::getSingleton()->delta);
 	Draw(r);
 }
 
-// HOT-APPLY asset resolution: re-resolve whenever the PROP changed (assign, replace,
-// reset-to-empty) — a latched first state was exactly the reported bug. Also retries a
-// not-yet-loaded asset (pak load order) because a failed resolve stores the guid only
-// on success. Shared by Draw() and BuildRTQuads() (whichever runs first this frame).
+// Re-resolves the asset caches whenever their guid prop changed; a failed resolve stores no
+// guid, so a not-yet-loaded asset is retried next frame.
 void ParticleEmitter::ResolveAssets()
 {
 	if (textureGuid != texGuidRes)
@@ -885,11 +855,11 @@ void ParticleEmitter::Draw(iRender* r)
 	if (parts.empty() || !transform) return;
 	ResolveAssets();
 
-	// The trail is an OPTION over any base mode (legacy renderMode 2 = billboard + trail).
+	// Legacy renderMode 2 = billboard + trail.
 	const bool wantTrail = trailEnabled || renderMode == 2;
 	const int  baseMode  = renderMode == 2 ? 0 : renderMode;
 
-	// camera basis (billboards face the camera; row-major view: rows = right/up/fwd columns)
+	// Camera basis: view is row-major, so right/up/fwd read out of its columns.
 	float view[16], proj[16];
 	r->getViewProj(view, proj);
 	glm::vec3 right(view[0], view[4], view[8]);
@@ -902,8 +872,7 @@ void ParticleEmitter::Draw(iRender* r)
 		l2w = glm::translate(glm::mat4(1.f), glm::vec3((float)cp.x, (float)cp.y, (float)cp.z)) * glm::mat4_cast(glm::quat((float)Q.w, (float)Q.x, (float)Q.y, (float)Q.z));
 	}
 
-	// MESH mode: pack instance records, one instanced draw (7.1 seam). Falls through when a
-	// trail is enabled so the ribbons still draw behind the mesh particles.
+	// MESH mode: pack instance records, one instanced draw; falls through when a trail is on.
 	bool meshDrawn = false;
 	if (baseMode == 3 && meshCache)
 	{
@@ -997,10 +966,8 @@ void ParticleEmitter::Draw(iRender* r)
 				quad(wp, rv, uv2, col);
 			}
 		}
-	// TRAIL ribbon (an OPTION over the base render): a camera-facing strip over the history.
-	// The v coordinate runs CONTINUOUSLY head(0) -> tail(1) so the trail texture stretches
-	// over the WHOLE ribbon (per-segment 0..1 repeated a full sprite per segment — that was
-	// the "ugly triangles"). Width and fade taper are user-controlled, not hardwired.
+	// TRAIL ribbon: camera-facing strip over the history. v runs continuously head(0) -> tail(1)
+	// so the trail texture stretches over the WHOLE ribbon, not once per segment.
 	static std::vector<float> trailV; trailV.clear();
 	if (wantTrail && trailHist.size() == parts.size() * (size_t)kTrailCap * 3)
 	{
@@ -1062,14 +1029,8 @@ void ParticleEmitter::Draw(iRender* r)
 	}
 }
 
-// RenderPhase::RTScene: refresh the per-frame RT geometry and register it in the TLAS so
-// ray-traced reflections and shadow rays see the particles EXACTLY as drawn:
-//  - billboard/stretched sprites -> a quad mesh (world-space verts + PER-VERTEX gradient/fade
-//    colors rewritten every frame; version bump -> in-place buffer update -> per-frame BLAS
-//    rebuild; the dead tail collapses to degenerate triangles);
-//  - trail ribbons -> a second quad mesh (real ribbon UVs, strip shadow footprint);
-//  - mesh-mode particles -> one TLAS instance per particle over the ASSET mesh (cached BLAS).
-// Faded particles (alpha < 0.02) drop out; the color pool carries the exact per-particle tint.
+// Refreshes this frame's RT geometry (sprite quads, trail ribbons, mesh-mode instances) and
+// registers it in the TLAS. Faded particles (alpha < 0.02) drop out.
 void ParticleEmitter::BuildRTQuads(iRender* r)
 {
 	if (parts.empty()) return;   // no addRTInstance -> not in the TLAS this frame
@@ -1129,8 +1090,8 @@ void ParticleEmitter::BuildRTQuads(iRender* r)
 			rtMesh->rtColorArray = new float[(size_t)cap * 24]();   // float4 x 6 verts per quad
 			rtMesh->rtDynamic     = true;   // renderer rebuilds the BLAS every frame
 			rtMesh->rtAlphaTested = true;   // rays alpha-test texture x particle fade
-			// Canonical quad UVs -- registered ONCE in the RT concat buffers, never touched
-			// again (world.ps reconstructs the same UVs analytically for the footprint test).
+			// Canonical quad UVs: registered ONCE in the RT concat buffers; world.ps reconstructs
+			// these exact values analytically, so they must never change.
 			static const float qu[12] = { 0,1, 1,1, 1,0, 0,1, 1,0, 0,0 };
 			for (int i = 0; i < cap; ++i) memcpy(rtMesh->uvArray + (size_t)i * 12, qu, sizeof(qu));
 			for (int i = 0; i < cap * 6; ++i)
@@ -1174,8 +1135,6 @@ void ParticleEmitter::BuildRTQuads(iRender* r)
 			const glm::vec3 quad[6] = { v0, v1, v2, v0, v2, v3 };
 			float* dst = v + (size_t)q * 18;
 			for (int k = 0; k < 6; ++k) { dst[k * 3] = quad[k].x; dst[k * 3 + 1] = quad[k].y; dst[k * 3 + 2] = quad[k].z; }
-			// Per-particle glow rides IN the color pool (HDR floats) -- the reflection breathes
-			// with the same Glow Over Life curve as the direct view.
 			const float gB = 1.f + glow * EvalCurve(glowOverLife, lt, 1.f);
 			float* cdst = vc + (size_t)q * 24;
 			for (int k = 0; k < 6; ++k) { cdst[k * 4] = col[0] * gB; cdst[k * 4 + 1] = col[1] * gB; cdst[k * 4 + 2] = col[2] * gB; cdst[k * 4 + 3] = col[3]; }
@@ -1186,9 +1145,8 @@ void ParticleEmitter::BuildRTQuads(iRender* r)
 		if (q > 0)
 		{
 			rtMesh->version++;
-			// Instance material: BLACK albedo, WHITE emissive x (1+glow) -- the per-vertex color
-			// pool carries the actual tint/fade, so the reflection matches the direct view; zero
-			// specular so nothing recurses off a particle. diff feeds the any-hit alpha test.
+			// Black albedo + white emissive: the per-vertex color pool carries the tint/fade.
+			// Zero specular so rays never recurse off a particle; diff feeds the any-hit test.
 			if (!rtMat) rtMat = new Material();
 			Texture* baseTex = texCache ? texCache : ShapeTex(spriteShape);
 			rtMat->diff  = baseTex;
@@ -1224,8 +1182,8 @@ void ParticleEmitter::BuildRTQuads(iRender* r)
 			rtTrailMesh->rtShadowShape = 2;   // ribbon: strip across u
 			for (int i = 0; i < tcap * 6; ++i)
 			{ rtTrailMesh->normalArray[i * 3] = 0.f; rtTrailMesh->normalArray[i * 3 + 1] = 0.f; rtTrailMesh->normalArray[i * 3 + 2] = 1.f; }
-			// Ribbon UVs are FIXED per quad slot (u across, v head->tail by segment index) --
-			// written once, valid forever (the concat UV registration is one-shot).
+			// Ribbon UVs are fixed per quad slot (u across, v head->tail): the concat UV
+			// registration is one-shot, so they are written once and never updated.
 			for (int qi = 0; qi < tcap; ++qi)
 			{
 				const int sgi = qi % quadsPer;                                  // segment within the ribbon
@@ -1297,9 +1255,8 @@ void ParticleEmitter::BuildRTQuads(iRender* r)
 	}
 }
 
-// End of Advance: publish this frame's particle LIGHT(s). lightCount == 1 -> one aggregated
-// point light at the alpha-weighted centroid (cheap, stable); N -> the N biggest particles
-// each carry a light. Color = weighted particle color x (1 + glow). One-frame submissions.
+// Publishes this frame's particle light(s): lightCount 0 = one per particle, 1 = a single light
+// at the alpha-weighted centroid, N = the N biggest particles. Color = particle color x (1+glow).
 void ParticleEmitter::SubmitLights()
 {
 	if (lightIntensity <= 0.f || parts.empty()) return;
@@ -1311,8 +1268,6 @@ void ParticleEmitter::SubmitLights()
 		    * glm::mat4_cast(glm::quat((float)Q.w, (float)Q.x, (float)Q.y, (float)Q.z));
 	}
 	const float gI = 1.f + (glow > 0.f ? glow : 0.f);
-	// Per-particle light SCALE m: Glow Over Life always breathes the light; Bind Light To
-	// Alpha additionally fades it with the particle's alpha -- no popping in/out.
 	struct LP { float w; float m; glm::vec3 p; float c[3]; };
 	static std::vector<LP> lps; lps.clear();
 	for (const P& p : parts)
@@ -1340,9 +1295,7 @@ void ParticleEmitter::SubmitLights()
 	};
 	if (lightCount <= 0)
 	{
-		// EVERY particle is a light (UE-style). Shadowless point lights are cheap in the
-		// shader (range early-out, no shadow rays); the renderer clamps the combined world
-		// set at its 256-light budget.
+		// One light per particle; the renderer clamps the world set at its 256-light budget.
 		for (const LP& l : lps) submit(l.p, l.c, l.m);
 	}
 	else if (lightCount == 1)

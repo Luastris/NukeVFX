@@ -1,10 +1,7 @@
 #pragma once
-// NukeVFX (7.3) — the engine's own particle system, a SEPARATE module by design (games that
-// need no VFX never pay for it). CPU simulation on nuke::Jobs, interactive: global Wind,
-// ForceField volumes, optional physics-raycast collision, sub-emitters. Rendering through
-// the neutral seams: camera-facing / velocity-stretched billboards + per-particle trails via
-// drawSpriteRun, MESH particles via the 7.1 instancing seam. An EFFECT is a PREFAB whose
-// atoms carry ParticleEmitter components — no side formats, standard inspector/undo/mods.
+// NukeVFX — particle system: CPU sim on nuke::Jobs (wind, force fields, raycast collision,
+// sub-emitters), rendering via billboards/trails (drawSpriteRun) and mesh instancing.
+// An effect is a PREFAB whose atoms carry ParticleEmitter components.
 #ifndef NUKEVFX_PARTICLES_H
 #define NUKEVFX_PARTICLES_H
 
@@ -23,8 +20,7 @@
 
 namespace nuke {
 
-// Local force volume for particles (and later cloth): attract/repel/vortex/turbulence
-// inside a sphere. Additive; lives on any atom, moves with it.
+// Local force volume: attract/repel/vortex/turbulence inside a sphere, additive, on any atom.
 class NUKEVFX_API ForceField : public Component
 {
 	NUKE_CLASS(ForceField, Component, "Effects")
@@ -46,9 +42,8 @@ public:
 	unsigned long long bendSubmitFrame = ~0ull;   // once-per-frame guard (OnRender runs per pass)
 };
 
-// THE emitter. Curves are flattened (t,value) pair arrays over normalized life 0..1; the
-// color gradient is flattened (t,r,g,b) stops. Reflected arrays -> inspector-editable,
-// serialized, moddable.
+// The emitter. Curves are flattened key arrays over normalized life 0..1; the color gradient
+// is flattened (t,r,g,b) stops.
 class NUKEVFX_API ParticleEmitter : public Component
 {
 	NUKE_CLASS(ParticleEmitter, Component, "Effects")
@@ -82,16 +77,11 @@ public:
 	[[nuke::prop(label="Drag", min=0)]]                 float drag = 0.0f;
 	[[nuke::prop(label="Wind Influence", min=0, max=1)]] float windInfluence = 0.0f;   // nuke::Wind::Sample
 	// ---- collision -------------------------------------------------------------------------
-	// World = honest collision with everything (physics rays in play; scene-mesh rays in the
-	// editor preview, budgeted). Surface = collide ONLY with one referenced atom's meshes
-	// (exact ray-vs-triangle, gives UV). No invented planes.
 	[[nuke::prop(label="Collision", enum="Off,World,Surface", tip="World = everything (physics). Surface = only the referenced atom's meshes.")]] int collision = 0;
 	[[nuke::prop(label="Surface", tip="Surface mode: the one atom (subtree) particles collide with.")]] Atom* collisionSurface = nullptr;
 	[[nuke::prop(label="Bounce", min=0, max=1)]]        float bounce = 0.3f;
 	[[nuke::prop(label="Collision Dampen", min=0, max=1)]] float collideDampen = 0.2f;
 	[[nuke::prop(label="Die On Collision")]]            bool  dieOnCollision = false;
-	// Water (7.5 stage 3): particles crossing a WATER surface splash rings exactly where
-	// they land, through the water module's query service — rain over water just works.
 	[[nuke::prop(label="Water Contact", tip="Particles hitting a water surface splash rings where they land (needs NukeWater loaded).")]] bool waterContact = false;
 	[[nuke::prop(label="Die On Water", tip="Water Contact: remove the particle at the surface (off = a damped bounce).")]] bool dieOnWater = true;
 	[[nuke::prop(label="Collision Events", tip="Emit 'vfx.collision' per hit: point, normal, hit atom, uv (json payload).")]] bool collisionEvents = false;
@@ -103,8 +93,7 @@ public:
 	[[nuke::prop(label="Color Gradient", widget="gradient")]] std::vector<float> colorGradient; // (t,r,g,b) stops
 	[[nuke::prop(label="Start Color")]]                 Color startColor = Color(1, 1, 1, 1);
 	// ---- render ----------------------------------------------------------------------------
-	// The trail is NOT a mode — it's an option layered over any base render (value 2 kept
-	// for old worlds: it draws billboard + trail now).
+	// Value 2 is legacy: it draws billboard + trail (the trail is an option, not a mode).
 	[[nuke::prop(label="Render", enum="Billboard,Stretched,Billboard + Trail,Mesh")]] int renderMode = 0;
 	[[nuke::prop(asset="texture", label="Texture")]]    std::string textureGuid;   // billboard/stretched
 	[[nuke::prop(label="Particle Shape", enum="Quad,Circle,Ring,Spark,Star,Smoke", tip="Built-in shape when no Texture is set (procedural, no asset needed).")]] int spriteShape = 1;
@@ -149,19 +138,18 @@ public:
 	float emitAccum = 0.f, burstAccum = 0.f, ageSec = 0.f;
 	double lastPos[3] = { 0, 0, 0 }; bool hasLastPos = false;   // atom velocity (inherit)
 	uint64_t instBuf = 0; iRender* instOwner = nullptr;         // Mesh mode instance buffer
-	// Trail history: kTrailCap*3 floats per particle, index-parallel with `parts` (spawn
-	// appends a block, swap-erase moves the back block). [kTrailCap-1] = the newest point.
+	// Trail history: kTrailCap*3 floats per particle, index-parallel with `parts`;
+	// [kTrailCap-1] = the newest point.
 	static const int kTrailCap = 32;
 	std::vector<float> trailHist;
-	// Asset caches track the guid they were resolved FROM — a changed/cleared prop re-resolves
-	// next draw (never latch: the inspector must hot-apply, including reset-to-empty).
+	// Asset caches track the guid they were resolved FROM — never latch, a changed/cleared
+	// prop must re-resolve on the next draw.
 	Texture* texCache = nullptr; Mesh* meshCache = nullptr; Material* matCache = nullptr;
 	Texture* trailTexCache = nullptr;
 	std::string texGuidRes, meshGuidRes, matGuidRes, trailTexGuidRes;
-	// RT quad meshes (reflections/shadow rays): sprite quads + trail ribbons, verts AND
-	// per-vertex colors (gradient/fade) rewritten every frame in world space; dead space =
-	// degenerate triangles. Owned materials carry the textures + emissive(glow) into the
-	// TLAS instance data; their color.a = average alive alpha (shadow gate).
+	// RT quad meshes (reflections/shadow rays): sprite quads + trail ribbons, world-space verts
+	// and per-vertex colors rewritten every frame; dead space = degenerate triangles. Owned material
+	// color.a = average alive alpha (shadow gate).
 	Mesh*     rtMesh = nullptr;      Material* rtMat = nullptr;      int rtCap = 0;
 	Mesh*     rtTrailMesh = nullptr; Material* rtTrailMat = nullptr; int rtTrailCap = 0;
 	void ResolveAssets();               // guid -> cache hot-apply (shared by Draw and the RT build)
