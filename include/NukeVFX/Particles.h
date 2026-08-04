@@ -46,6 +46,9 @@ public:
 // is flattened (t,r,g,b) stops.
 class NUKEVFX_API ParticleEmitter : public Component
 {
+	// OnRender fires per camera pass; the editor-preview sim step must happen once a frame.
+	unsigned long long previewStepFrame = ~0ull;
+
 	NUKE_CLASS(ParticleEmitter, Component, "Effects")
 public:
 	// ---- emission --------------------------------------------------------------------------

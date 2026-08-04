@@ -254,100 +254,63 @@ static Texture* ShapeTex(int shape)
 // ---- exact ray vs meshes (collision Surface/editor-preview World) -------------------------
 struct VfxRayHit { float t; glm::vec3 point, normal; float u, v; Atom* atom; };
 
-// Möller–Trumbore over the mesh's unindexed triangles in LOCAL space (AABB slab early-out);
-// fills point/normal/UV and returns whether anything was hit within maxT.
+// Ray vs one mesh in LOCAL space. The heavy lifting lives in the engine (Mesh::RaycastLocal =
+// a cached triangle BVH): testing every triangle here turned a single large mesh into a
+// hundred-millisecond frame, because a big world AABB defeats the cheap early-out.
 static bool RayMesh(Mesh* m, const glm::vec3& ro, const glm::vec3& rd, float maxT, VfxRayHit& out)
 {
-	if (!m || !m->vertexArray || m->numVerts < 3) return false;
-	m->EnsureBounds();
-	{
-		float t0 = 0.f, t1 = maxT;
-		for (int k = 0; k < 3; ++k)
-		{
-			const float o = (&ro.x)[k], d = (&rd.x)[k];
-			if (fabsf(d) < 1e-8f) { if (o < m->aabbMin[k] || o > m->aabbMax[k]) return false; continue; }
-			float ta = (m->aabbMin[k] - o) / d, tb = (m->aabbMax[k] - o) / d;
-			if (ta > tb) std::swap(ta, tb);
-			t0 = std::max(t0, ta); t1 = std::min(t1, tb);
-			if (t0 > t1) return false;
-		}
-	}
-	bool hit = false;
-	const int tris = m->numVerts / 3;
-	for (int tri = 0; tri < tris; ++tri)
-	{
-		const float* vp = m->vertexArray + (size_t)tri * 9;
-		glm::vec3 a(vp[0], vp[1], vp[2]), b(vp[3], vp[4], vp[5]), c(vp[6], vp[7], vp[8]);
-		glm::vec3 e1 = b - a, e2 = c - a;
-		glm::vec3 pvv = glm::cross(rd, e2);
-		float det = glm::dot(e1, pvv);
-		if (fabsf(det) < 1e-9f) continue;
-		float inv = 1.f / det;
-		glm::vec3 tv = ro - a;
-		float bu = glm::dot(tv, pvv) * inv;
-		if (bu < 0.f || bu > 1.f) continue;
-		glm::vec3 qv = glm::cross(tv, e1);
-		float bv = glm::dot(rd, qv) * inv;
-		if (bv < 0.f || bu + bv > 1.f) continue;
-		float t = glm::dot(e2, qv) * inv;
-		if (t < 1e-5f || t > maxT || (hit && t >= out.t)) continue;
-		hit = true;
-		out.t = t; out.point = ro + rd * t;
-		glm::vec3 n = glm::cross(e1, e2);
-		float l = glm::length(n);
-		out.normal = l > 1e-9f ? n / l : glm::vec3(0, 1, 0);
-		if (glm::dot(out.normal, rd) > 0.f) out.normal = -out.normal;   // face the incoming ray
-		out.u = out.v = -1.f;
-		if (m->uvArray)
-		{
-			const float* uv = m->uvArray + (size_t)tri * 6;
-			float w0 = 1.f - bu - bv;
-			out.u = uv[0] * w0 + uv[2] * bu + uv[4] * bv;
-			out.v = uv[1] * w0 + uv[3] * bu + uv[5] * bv;
-		}
-	}
-	return hit;
-}
-
-// Ray vs ONE atom's MeshRenderer, transform-aware (ray to local, hit back to world).
-static bool RayAtomMesh(Atom* a, const glm::vec3& ro, const glm::vec3& rd, float maxT, VfxRayHit& out)
-{
-	MeshRenderer* mr = a ? a->GetComponent<MeshRenderer>() : nullptr;
-	if (!mr || !mr->enabled || !mr->mesh) return false;
-	Transform& t = a->GetTransform();
-	Vector3 P = t.globalPosition(); Quaternion Q = t.globalRotation(); Vector3 S = t.globalScale();
-	glm::mat4 w = glm::translate(glm::mat4(1.f), glm::vec3((float)P.x, (float)P.y, (float)P.z))
-	            * glm::mat4_cast(glm::quat((float)Q.w, (float)Q.x, (float)Q.y, (float)Q.z))
-	            * glm::scale(glm::mat4(1.f), glm::vec3((float)S.x, (float)S.y, (float)S.z));
-	glm::mat4 inv = glm::inverse(w);
-	glm::vec3 lro = glm::vec3(inv * glm::vec4(ro, 1));
-	glm::vec3 lrd = glm::vec3(inv * glm::vec4(rd, 0));   // unnormalized on purpose: t stays in world units
-	VfxRayHit lh;
-	if (!RayMesh(mr->mesh, lro, lrd, maxT, lh)) return false;
-	out.t = lh.t; out.u = lh.u; out.v = lh.v; out.atom = a;
-	out.point = glm::vec3(w * glm::vec4(lh.point, 1));
-	glm::vec3 wn = glm::vec3(glm::transpose(inv) * glm::vec4(lh.normal, 0));
-	float l = glm::length(wn); out.normal = l > 1e-9f ? wn / l : glm::vec3(0, 1, 0);
+	if (!m) return false;
+	Mesh::RayHit h;
+	const float o[3] = { ro.x, ro.y, ro.z };
+	const float d[3] = { rd.x, rd.y, rd.z };
+	if (!m->RaycastLocal(o, d, maxT, h)) return false;
+	out.t = h.t;
+	out.point  = glm::vec3(h.point[0],  h.point[1],  h.point[2]);
+	out.normal = glm::vec3(h.normal[0], h.normal[1], h.normal[2]);
+	out.u = h.u; out.v = h.v;
 	return true;
 }
 
-// Ray vs an atom SUBTREE (Surface mode: the referenced atom + its children = one surface).
+// Ray vs every mesh under one atom (collision mode "Surface"): the ray is transformed into each
+// mesh's local frame, and the nearest hit wins. Hit point/normal come back in WORLD space.
 static bool RayAtomSubtree(Atom* root, const glm::vec3& ro, const glm::vec3& rd, float maxT, VfxRayHit& out)
 {
 	if (!root) return false;
-	bool hit = false; VfxRayHit h;
-	std::vector<Atom*> stack{ root };
+	bool any = false;
+	out.t = maxT;
+	std::vector<Atom*> stack;
+	stack.push_back(root);
 	while (!stack.empty())
 	{
 		Atom* a = stack.back(); stack.pop_back();
 		if (!a) continue;
-		if (RayAtomMesh(a, ro, rd, maxT, h)) { out = h; maxT = h.t; hit = true; }
 		for (Atom* c : a->children) stack.push_back(c);
+		MeshRenderer* mr = a->GetComponent<MeshRenderer>();
+		if (!mr || !mr->enabled || !mr->mesh) continue;
+		Transform& t = a->GetTransform();
+		Vector3 P = t.globalPosition(); Quaternion Q = t.globalRotation(); Vector3 S = t.globalScale();
+		glm::mat4 w = glm::translate(glm::mat4(1.f), glm::vec3((float)P.x, (float)P.y, (float)P.z))
+		            * glm::mat4_cast(glm::quat((float)Q.w, (float)Q.x, (float)Q.y, (float)Q.z))
+		            * glm::scale(glm::mat4(1.f), glm::vec3((float)S.x, (float)S.y, (float)S.z));
+		glm::mat4 inv = glm::inverse(w);
+		glm::vec3 lro = glm::vec3(inv * glm::vec4(ro, 1.f));
+		glm::vec3 lrd = glm::vec3(inv * glm::vec4(rd, 0.f));
+		const float lsc = glm::length(lrd);
+		if (lsc < 1e-8f) continue;
+		lrd /= lsc;                       // local ray length scales with the transform
+		VfxRayHit lh;
+		if (!RayMesh(mr->mesh, lro, lrd, out.t * lsc, lh)) continue;
+		const float tWorld = lh.t / lsc;
+		if (any && tWorld >= out.t) continue;
+		any = true;
+		out.t = tWorld;
+		out.point  = glm::vec3(w * glm::vec4(lh.point, 1.f));
+		out.normal = glm::normalize(glm::vec3(glm::transpose(inv) * glm::vec4(lh.normal, 0.f)));
+		out.u = lh.u; out.v = lh.v; out.atom = a;
 	}
-	return hit;
+	return any;
 }
 
-// ---- editor-preview scene snapshot --------------------------------------------------------
 // Outside play there are no physics bodies, so World collision raycasts scene meshes against
 // this snapshot: cached inverse matrices + world AABBs, rebuilt once per frame (Time::frame).
 struct SceneEntry { Atom* atom; Mesh* mesh; glm::mat4 w, inv; glm::vec3 mn, mx; };
@@ -544,11 +507,12 @@ void ParticleEmitter::BurstAt(const Vector3& worldPos, double count)
 			case 4:   // mesh surface (uniform-ish: random triangle, barycentric point, its normal)
 				if (emitMesh && emitMesh->numVerts >= 3)
 				{
-					int tri = (int)(Rand::Value("vfx") * (emitMesh->numVerts / 3 - 1));
-					const float* vp = emitMesh->vertexArray;   // xyz per vert, unindexed
-					glm::vec3 a(vp[(tri * 3 + 0) * 3], vp[(tri * 3 + 0) * 3 + 1], vp[(tri * 3 + 0) * 3 + 2]);
-					glm::vec3 b(vp[(tri * 3 + 1) * 3], vp[(tri * 3 + 1) * 3 + 1], vp[(tri * 3 + 1) * 3 + 2]);
-					glm::vec3 c(vp[(tri * 3 + 2) * 3], vp[(tri * 3 + 2) * 3 + 1], vp[(tri * 3 + 2) * 3 + 2]);
+					int tri = (int)(Rand::Value("vfx") * (emitMesh->TriCount() - 1));
+					const float* vp = emitMesh->vertexArray;   // xyz per vert (soup OR indexed via TriIndex)
+					const uint32_t i0 = emitMesh->TriIndex(tri, 0), i1 = emitMesh->TriIndex(tri, 1), i2 = emitMesh->TriIndex(tri, 2);
+					glm::vec3 a(vp[i0 * 3], vp[i0 * 3 + 1], vp[i0 * 3 + 2]);
+					glm::vec3 b(vp[i1 * 3], vp[i1 * 3 + 1], vp[i1 * 3 + 2]);
+					glm::vec3 c(vp[i2 * 3], vp[i2 * 3 + 1], vp[i2 * 3 + 2]);
 					float u = (float)Rand::Value("vfx"), v = (float)Rand::Value("vfx");
 					if (u + v > 1.f) { u = 1.f - u; v = 1.f - v; }
 					lp = a + (b - a) * u + (c - a) * v;
@@ -819,8 +783,18 @@ void ParticleEmitter::OnRender(iRender* r, RenderPhase phase)
 	}
 	if (phase != RenderPhase::Transparent || !r) return;
 	// Editor preview: while not playing the sim advances from the render hook instead of Update.
+	// ONCE per frame — this hook fires per camera pass, and stepping the sim (collisions and all)
+	// again for every viewport multiplied the cost by the number of open views.
 	AppInstance* app = AppInstance::GetSingleton();
-	if (app->playState == 0) Advance((float)Time::getSingleton()->delta);
+	if (app->playState == 0)
+	{
+		const unsigned long long fr = Time::getSingleton()->frame;
+		if (fr != previewStepFrame)
+		{
+			previewStepFrame = fr;
+			Advance((float)Time::getSingleton()->delta);
+		}
+	}
 	Draw(r);
 }
 
