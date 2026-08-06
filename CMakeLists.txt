@@ -13,14 +13,15 @@ set(VCPKG_INSTALLED "$ENV{VCPKG_ROOT}/installed/x64-windows")   # VCPKG_ROOT env
 
 # Reflection prebuild (nukegen module mode): scans the public header for NUKE_CLASS +
 # [[nuke::prop/func]] and generates the in-TU registration include.
-find_package(Python3 COMPONENTS Interpreter)
+set(NUKE_GEN "${NUKE_ROOT}/NukeUtils/bin/NukeGen.exe")   # built FIRST by the superbuild
 add_custom_command(
     OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeVFX.gen.inc"
-    COMMAND ${Python3_EXECUTABLE} "${NUKE_ROOT}/NukeUtils/nukegen.py"
+    COMMAND "${NUKE_GEN}"
             --include "${CMAKE_CURRENT_SOURCE_DIR}/include"
             --out "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeVFX.gen.inc"
             --init NukeReflectInit_NukeVFX --no-includes
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/include/NukeVFX/Particles.h"
+            --sdk "${NUKE_ROOT}/NukeUtils/sdk/nukesdk/NukeVFX.sdk.h" --doc "${NUKE_ROOT}/NukeUtils/sdkdocs/NukeVFX.md"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/include/NukeVFX/Particles.h" "${NUKE_GEN}"
     COMMENT "nukegen: NukeVFX reflection")
 
 add_library(NukeVFX SHARED
