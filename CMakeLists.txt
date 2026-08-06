@@ -36,11 +36,21 @@ set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/NukeVFX.gen.inc" PR
 # OWN public API (NUKETILEMAP_API) so native game modules can link NukeVFX.lib and
 # call the tilemap directly (mapgen fills, A* queries — no reflection on hot paths).
 target_compile_definitions(NukeVFX PRIVATE
-    WIN32 _WINDOWS NOMINMAX _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS
+    _USE_MATH_DEFINES
     GLM_ENABLE_EXPERIMENTAL
-    BOOST_ALL_DYN_LINK
     NUKEVFX_EXPORTS
 )
+if(WIN32)
+    target_compile_definitions(NukeVFX PRIVATE
+        WIN32 _WINDOWS NOMINMAX _CRT_SECURE_NO_WARNINGS
+        BOOST_ALL_DYN_LINK
+    )
+else()
+    target_compile_options(NukeVFX PRIVATE -Wno-c++11-narrowing -Wno-unknown-attributes)
+    set_target_properties(NukeVFX PROPERTIES
+        PREFIX ""
+        BUILD_RPATH "@loader_path/..;$ORIGIN/..")
+endif()
 
 target_include_directories(NukeVFX PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include

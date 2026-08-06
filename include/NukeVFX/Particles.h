@@ -12,10 +12,14 @@
 #include <vector>
 #include <string>
 
-#ifdef NUKEVFX_EXPORTS
-#define NUKEVFX_API __declspec(dllexport)
+#ifdef _WIN32
+  #ifdef NUKEVFX_EXPORTS
+  #define NUKEVFX_API __declspec(dllexport)
+  #else
+  #define NUKEVFX_API __declspec(dllimport)
+  #endif
 #else
-#define NUKEVFX_API __declspec(dllimport)
+  #define NUKEVFX_API __attribute__((visibility("default")))
 #endif
 
 namespace nuke {

@@ -41,5 +41,5 @@ public:
 };
 
 // Exported under the unmangled symbol "plugin" — the loader imports it via boost::dll.
-extern "C" __declspec(dllexport) NukeVFXModule plugin;
+extern "C" BOOST_SYMBOL_EXPORT NukeVFXModule plugin;
 NukeVFXModule plugin;
