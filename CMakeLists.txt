@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(NukeVFX CXX)
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/../NukeEngine/cmake/NukeRunDir.cmake")   # NUKE_RUN_SUBDIR: x64 / macos / linux
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -13,7 +15,7 @@ set(VCPKG_INSTALLED "$ENV{VCPKG_ROOT}/installed/x64-windows")   # VCPKG_ROOT env
 
 # Reflection prebuild (nukegen module mode): scans the public header for NUKE_CLASS +
 # [[nuke::prop/func]] and generates the in-TU registration include.
-set(NUKE_GEN "${NUKE_ROOT}/NukeUtils/bin/NukeGen.exe")   # built FIRST by the superbuild
+set(NUKE_GEN "${NUKE_ROOT}/NukeUtils/bin/NukeGen${NUKE_HOSTTOOL_SUFFIX}")   # built FIRST by the superbuild
 add_custom_command(
     OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeVFX.gen.inc"
     COMMAND "${NUKE_GEN}"
@@ -62,7 +64,7 @@ target_include_directories(NukeVFX PRIVATE
 )
 
 target_link_directories(NukeVFX PRIVATE
-    ${NUKE_ROOT}/NukeEngine/x64/$<CONFIG>            # NukeEngine.lib (import lib)
+    ${NUKE_ROOT}/NukeEngine/${NUKE_RUN_SUBDIR}/$<CONFIG>            # NukeEngine.lib (import lib)
     ${VCPKG_INSTALLED}/$<$<CONFIG:Debug>:debug/>lib  # boost (auto-linked)
 )
 
@@ -71,7 +73,7 @@ target_link_libraries(NukeVFX PRIVATE
 )
 
 # Deploy the plugin DLL into the host's modules/ folder (editor + player both load from here).
-set(MODULES_DIR "${NUKE_ROOT}/NukeEngine/x64/$<CONFIG>/modules")
+set(MODULES_DIR "${NUKE_ROOT}/NukeEngine/${NUKE_RUN_SUBDIR}/$<CONFIG>/modules")
 add_custom_command(TARGET NukeVFX POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${MODULES_DIR}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
