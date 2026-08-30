@@ -13,6 +13,7 @@
 #include <service/iWaterQuery.h>
 #include <API/Model/MeshRenderer.h>   // Surface collision + editor-preview scene rays
 #include <API/Model/Events.h>         // vfx.collision events (point/normal/atom/uv)
+#include <API/Model/Surface.h>        // LiveMaterial hit reactions on collision
 #include <API/Model/World.h>          // editor-preview World-mode collision scans the scene
 #include <interface/AppInstance.h>
 #include <render/irender.h>
@@ -477,8 +478,31 @@ void ParticleEmitter::BurstAt(const Vector3& worldPos, double count)
 	glm::quat rot((float)Q.w, (float)Q.x, (float)Q.y, (float)Q.z);
 	Mesh* emitMesh = nullptr;
 	if (shape == 4 && !emitMeshGuid.empty()) emitMesh = ResDB::getSingleton()->GetMesh(emitMeshGuid);
+	// No authored mesh: emit from the atom's own rendered mesh, else the parent's (prefab
+	// flames riding a burning object) - sampled through that atom's FULL world transform.
+	Atom* srcAtom = nullptr;
+	Mesh* srcMesh = nullptr;
+	glm::vec3 sPos(0); glm::quat sRot(1, 0, 0, 0); glm::vec3 sScl(1);
+	if (shape == 4 && !emitMesh && atom)
+	{
+		Atom* cand[2] = { atom, atom->parent };
+		for (Atom* a : cand)
+		{
+			MeshRenderer* mr = a ? a->GetComponent<MeshRenderer>() : nullptr;
+			if (mr && mr->mesh && mr->mesh->numVerts >= 3) { srcAtom = a; srcMesh = mr->mesh; break; }
+		}
+		if (srcAtom)
+		{
+			Transform& st = srcAtom->GetTransform();
+			Vector3 p = st.globalPosition(); Quaternion q = st.globalRotation(); Vector3 sc = st.globalScale();
+			sPos = glm::vec3((float)p.x, (float)p.y, (float)p.z);
+			sRot = glm::quat((float)q.w, (float)q.x, (float)q.y, (float)q.z);
+			sScl = glm::vec3((float)sc.x, (float)sc.y, (float)sc.z);
+		}
+	}
 	for (int i = 0; i < (int)count && (int)parts.size() < maxParticles; ++i)
 	{
+		bool worldSample = false;   // case 4 via srcMesh: lp/dir already world-space
 		glm::vec3 lp(0), dir(0, 1, 0);
 		switch (shape)
 		{
@@ -505,11 +529,13 @@ void ParticleEmitter::BurstAt(const Vector3& worldPos, double count)
 				break;
 			}
 			case 4:   // mesh surface (uniform-ish: random triangle, barycentric point, its normal)
-				if (emitMesh && emitMesh->numVerts >= 3)
+			{
+				Mesh* m = emitMesh && emitMesh->numVerts >= 3 ? emitMesh : srcMesh;
+				if (m)
 				{
-					int tri = (int)(Rand::Value("vfx") * (emitMesh->TriCount() - 1));
-					const float* vp = emitMesh->vertexArray;   // xyz per vert (soup OR indexed via TriIndex)
-					const uint32_t i0 = emitMesh->TriIndex(tri, 0), i1 = emitMesh->TriIndex(tri, 1), i2 = emitMesh->TriIndex(tri, 2);
+					int tri = (int)(Rand::Value("vfx") * (m->TriCount() - 1));
+					const float* vp = m->vertexArray;   // xyz per vert (soup OR indexed via TriIndex)
+					const uint32_t i0 = m->TriIndex(tri, 0), i1 = m->TriIndex(tri, 1), i2 = m->TriIndex(tri, 2);
 					glm::vec3 a(vp[i0 * 3], vp[i0 * 3 + 1], vp[i0 * 3 + 2]);
 					glm::vec3 b(vp[i1 * 3], vp[i1 * 3 + 1], vp[i1 * 3 + 2]);
 					glm::vec3 c(vp[i2 * 3], vp[i2 * 3 + 1], vp[i2 * 3 + 2]);
@@ -518,12 +544,28 @@ void ParticleEmitter::BurstAt(const Vector3& worldPos, double count)
 					lp = a + (b - a) * u + (c - a) * v;
 					glm::vec3 n = glm::cross(b - a, c - a);
 					float l = glm::length(n); dir = l > 1e-6f ? n / l : glm::vec3(0, 1, 0);
+					if (m == srcMesh)
+					{
+						lp = sPos + sRot * (lp * sScl);
+						dir = sRot * dir;
+						worldSample = true;
+					}
 				}
 				break;
+			}
 		}
 		P pt{};
-		glm::vec3 wp = localSpace ? lp : base + rot * lp;
-		glm::vec3 wd = localSpace ? dir : rot * dir;
+		glm::vec3 wp = worldSample ? lp : (localSpace ? lp : base + rot * lp);
+		glm::vec3 wd = worldSample ? dir : (localSpace ? dir : rot * dir);
+		// Mask gate: a cold sample is a skipped attempt, so flames cover exactly the hot
+		// region and the emission amount grows with it (the fire visibly spreads).
+		if (shape == 4 && !emitMask.empty())
+		{
+			Atom* maskAtom = srcAtom ? srcAtom : atom;
+			const double mv = maskAtom
+				? Surface::ValueAt(maskAtom, emitMask, Vector3(wp.x, wp.y, wp.z)) : 1.0;
+			if (Rand::Value("vfx") >= mv) continue;
+		}
 		pt.pos[0] = wp.x; pt.pos[1] = wp.y; pt.pos[2] = wp.z;
 		float spd = Rnd(speedMin, speedMax);
 		pt.vel[0] = wd.x * spd; pt.vel[1] = wd.y * spd; pt.vel[2] = wd.z * spd;
@@ -695,6 +737,10 @@ void ParticleEmitter::Advance(float dt)
 					p.pos[0] = np.x; p.pos[1] = np.y; p.pos[2] = np.z;
 					if (collisionEvents && eventsDone < 64)
 					{ ++eventsDone; EmitCollisionEvent(atom, hp, hn, hitAtom, hu, hv); }
+					// LiveMaterial: the hit surface plays its own typed reaction.
+					if (surfaceHits && hitAtom && !editorPreview)
+						Surface::Hit(hitAtom, surfaceHitType,
+						             Vector3(hp.x, hp.y, hp.z), Vector3(hn.x, hn.y, hn.z), spd);
 				}
 			}
 			if (collided && dieOnCollision) dead = true;

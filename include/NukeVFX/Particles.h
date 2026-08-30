@@ -68,7 +68,8 @@ public:
 	[[nuke::prop(label="Shape Extents")]]               Vector3 shapeExtents = Vector3(0.5, 0.5, 0.5);   // box half
 	[[nuke::prop(label="Cone Angle", min=0, max=89)]]   float coneAngle = 25.0f;       // deg from +Y
 	[[nuke::prop(label="From Shell", tip="Emit from the shape surface instead of the volume.")]] bool fromShell = false;
-	[[nuke::prop(asset="mesh", label="Emit Mesh", tip="MeshSurface shape: emit from this mesh's triangles.")]] std::string emitMeshGuid;
+	[[nuke::prop(asset="mesh", label="Emit Mesh", tip="MeshSurface shape: emit from this mesh's triangles. Empty = this atom's own rendered mesh, else the parent atom's (prefab flames riding a burning object).")]] std::string emitMeshGuid;
+	[[nuke::prop(label="Emit Mask", tip="MeshSurface shape: emit only where this painted surface condition is hot on the source atom (e.g. \"burn\" - flames track the fire front and grow with it). Cold samples are skipped, so emission scales with the hot area. Empty = the whole surface.")]] std::string emitMask;
 	// ---- initial ranges --------------------------------------------------------------------
 	[[nuke::prop(label="Life Min", min=0.01)]]          float lifeMin = 1.0f;
 	[[nuke::prop(label="Life Max", min=0.01)]]          float lifeMax = 2.0f;
@@ -93,6 +94,10 @@ public:
 	[[nuke::prop(label="Die On Water", tip="Water Contact: remove the particle at the surface (off = a damped bounce).")]] bool dieOnWater = true;
 	[[nuke::prop(label="Collision Events", tip="Emit 'vfx.collision' per hit: point, normal, hit atom, uv (json payload).")]] bool collisionEvents = false;
 	[[nuke::prop(label="Collision Budget", min=0, tip="Max collision rays per frame; particles take turns and the ray reach stretches over skipped frames, so nothing tunnels. 0 = every particle every frame.")]] int collisionBudget = 512;
+	// LiveMaterial integration: every collision fires the HIT SURFACE's own reaction
+	// (particles/decals/sound from ITS material); the particle's speed is the impulse.
+	[[nuke::prop(label="Surface Hits", tip="Collisions fire the hit surface's LiveMaterial reaction (its own decal/prefab/sound)")]] bool surfaceHits = false;
+	[[nuke::prop(label="Hit Type", tip="Typed hit id sent to the surface (empty matches its any-hit entry)")]] std::string surfaceHitType;
 	// ---- over-lifetime ---------------------------------------------------------------------
 	[[nuke::prop(label="Size Over Life", widget="curve")]]  std::vector<float> sizeOverLife;    // keys (t,v,inTan,outTan)
 	[[nuke::prop(label="Alpha Over Life", widget="curve", min=0, max=1)]] std::vector<float> alphaOverLife;   // keys (t,v,inTan,outTan); alpha is 0..1
