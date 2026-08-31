@@ -19,10 +19,7 @@ set(NUKE_GEN "${NUKE_ROOT}/NukeUtils/bin/NukeGen${NUKE_HOSTTOOL_SUFFIX}")   # bu
 add_custom_command(
     OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeVFX.gen.inc"
     COMMAND "${NUKE_GEN}"
-            --include "${CMAKE_CURRENT_SOURCE_DIR}/include"
-            --out "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeVFX.gen.inc"
-            --init NukeReflectInit_NukeVFX --no-includes
-            --sdk "${NUKE_ROOT}/NukeUtils/sdk/nukesdk/NukeVFX.sdk.h" --doc "${NUKE_ROOT}/docs/api/NukeVFX.md"
+            --module "${CMAKE_CURRENT_SOURCE_DIR}"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/include/NukeVFX/Particles.h" "${NUKE_GEN}"
     COMMENT "nukegen: NukeVFX reflection")
 
