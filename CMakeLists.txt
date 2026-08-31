@@ -22,7 +22,7 @@ add_custom_command(
             --include "${CMAKE_CURRENT_SOURCE_DIR}/include"
             --out "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeVFX.gen.inc"
             --init NukeReflectInit_NukeVFX --no-includes
-            --sdk "${NUKE_ROOT}/NukeUtils/sdk/nukesdk/NukeVFX.sdk.h" --doc "${NUKE_ROOT}/NukeUtils/sdkdocs/NukeVFX.md"
+            --sdk "${NUKE_ROOT}/NukeUtils/sdk/nukesdk/NukeVFX.sdk.h" --doc "${NUKE_ROOT}/docs/api/NukeVFX.md"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/include/NukeVFX/Particles.h" "${NUKE_GEN}"
     COMMENT "nukegen: NukeVFX reflection")
 
@@ -73,10 +73,11 @@ target_link_libraries(NukeVFX PRIVATE
 )
 
 # Deploy the plugin DLL into the host's modules/ folder (editor + player both load from here).
-set(MODULES_DIR "${NUKE_ROOT}/NukeEngine/${NUKE_RUN_SUBDIR}/$<CONFIG>/modules")
+set(MODULES_DIR "${NUKE_ROOT}/NukeEngine/${NUKE_RUN_SUBDIR}/$<CONFIG>/plugins")
 add_custom_command(TARGET NukeVFX POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${MODULES_DIR}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "$<TARGET_FILE:NukeVFX>" "${MODULES_DIR}/"
-    COMMENT "Deploying NukeVFX.dll to modules/"
+    COMMAND ${CMAKE_COMMAND} -E rm -f "${MODULES_DIR}/../modules/$<TARGET_FILE_NAME:NukeVFX>"
+    COMMENT "Deploying NukeVFX.dll to plugins/"
 )
