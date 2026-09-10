@@ -24,28 +24,6 @@
 
 namespace nuke {
 
-// Local force volume: attract/repel/vortex/turbulence inside a sphere, additive, on any atom.
-class NUKEVFX_API ForceField : public Component
-{
-	NUKE_CLASS(ForceField, Component, "Effects")
-public:
-	[[nuke::prop(label="Mode", enum="Attract,Repel,Vortex,Turbulence")]] int mode = 1;
-	[[nuke::prop(label="Radius", min=0)]]    float radius = 5.0f;
-	[[nuke::prop(label="Strength")]]         float strength = 10.0f;   // m/s^2 at the center
-	[[nuke::prop(label="Falloff", min=0, max=1, tip="0 = full strength to the edge, 1 = linear fade.")]] float falloff = 1.0f;
-
-	ForceField();
-	void Init(Atom* parent) override;
-	void Destroy() override;
-	void Update() override;
-	void FixedUpdate() override;
-	void Pause() override;
-	void Reset() override;
-	void OnRender(iRender* r, RenderPhase phase) override;   // selected-field gizmo + bend-volume submit
-
-	unsigned long long bendSubmitFrame = ~0ull;   // once-per-frame guard (OnRender runs per pass)
-};
-
 // The emitter. Curves are flattened key arrays over normalized life 0..1; the color gradient
 // is flattened (t,r,g,b) stops.
 class NUKEVFX_API ParticleEmitter : public Component
@@ -122,6 +100,11 @@ public:
 	[[nuke::prop(label="Trail Fade", min=0, max=1, tip="How much the ribbon fades out toward the tail.")]] float trailFade = 1.0f;
 	[[nuke::prop(asset="texture", label="Trail Texture", tip="Stretched ALONG the whole ribbon (u across, v head->tail). Empty = plain ribbon.")]] std::string trailTextureGuid;
 	[[nuke::prop(label="Soft Fade", min=0, tip="Soft particles: fade within this distance of scene geometry (needs a depth prepass - TAA/SSR/decals on the camera). 0 = off.")]] float softFade = 0.0f;
+	// ---- volumetric fog interplay (World Settings > Volumetric Fog) ---------------------------
+	[[nuke::prop(label="Volumetric Lighting", min=0, max=1, tip="Light the sprites by the froxel fog grid (sun through its shadows, point/spot, probe ambient): 1 = the grid's light replaces the authored brightness - smoke sits in the god rays. Needs Volumetric Fog on.")]] float volumeLight = 0.0f;
+	[[nuke::prop(label="Six-Way Lighting", tip="Hero smoke: two lightmaps hold the puff lit from six directions (A.rgb = +right/-right/+up, B.rgb = -up/+front/-front, A.a = opacity); every scene light shades the puff by its direction.")]] bool sixWay = false;
+	[[nuke::prop(asset="texture", label="Six-Way Map A")]] std::string sixWayGuidA;
+	[[nuke::prop(asset="texture", label="Six-Way Map B")]] std::string sixWayGuidB;
 	// ---- lighting / ray tracing ------------------------------------------------------------
 	[[nuke::prop(label="Glow", min=0, tip="HDR emissive boost: particle color is multiplied by (1 + glow), so bloom picks it up and reflected particles glow too. 0 = off.")]] float glow = 0.0f;
 	[[nuke::prop(label="Glow Over Life", widget="curve", min=0, tip="Multiplier of Glow (and of the particle light) over the particle's life — emission breathes in and out instead of popping.")]] std::vector<float> glowOverLife;   // keys (t,v,inTan,outTan)
@@ -158,7 +141,8 @@ public:
 	// prop must re-resolve on the next draw.
 	Texture* texCache = nullptr; Mesh* meshCache = nullptr; Material* matCache = nullptr;
 	Texture* trailTexCache = nullptr;
-	std::string texGuidRes, meshGuidRes, matGuidRes, trailTexGuidRes;
+	Texture* sixACache = nullptr; Texture* sixBCache = nullptr;
+	std::string texGuidRes, meshGuidRes, matGuidRes, trailTexGuidRes, sixAGuidRes, sixBGuidRes;
 	// RT quad meshes (reflections/shadow rays): sprite quads + trail ribbons, world-space verts
 	// and per-vertex colors rewritten every frame; dead space = degenerate triangles. Owned material
 	// color.a = average alive alpha (shadow gate).

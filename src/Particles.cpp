@@ -8,7 +8,7 @@
 #include <API/Model/Rand.h>
 #include <API/Model/DebugDraw.h>
 #include <API/Model/Light.h>          // FrameLights: glowing particles light the scene
-#include <API/Model/BendVolumes.h>    // force fields bend foliage too (7.4)
+#include <API/Model/ForceField.h>     // the engine's Force Field (particles, fluid fog and foliage all read it)
 #include <interface/Services.h>       // iWaterQuery: rain drops splash rings on water
 #include <service/iWaterQuery.h>
 #include <API/Model/MeshRenderer.h>   // Surface collision + editor-preview scene rays
@@ -29,94 +29,27 @@ using namespace nuke;
 
 namespace nuke {
 
-// ---- ForceField registry -------------------------------------------------------------------
-static boost::mutex gFFLock;
-static std::vector<ForceField*> gFields;
+// The Force Fields (engine core): a frame snapshot so the sim jobs never touch the registry.
+typedef ForceFieldSnap FFSnap;
+static void SnapFields(std::vector<FFSnap>& out) { ForceField::Snapshot(out); }
 
-ForceField::ForceField() : Component("ForceField") {}
-void ForceField::Init(Atom* parent)
-{
-	atom = parent; transform = &parent->GetTransform();
-	parent->components.push_back(this);
-	boost::mutex::scoped_lock l(gFFLock);
-	if (std::find(gFields.begin(), gFields.end(), this) == gFields.end()) gFields.push_back(this);
-}
-void ForceField::Destroy()
-{
-	boost::mutex::scoped_lock l(gFFLock);
-	gFields.erase(std::remove(gFields.begin(), gFields.end(), this), gFields.end());
-}
-// Submits the field as an engine BendVolume (so foliage bends too) and draws the selected
-// field's gizmo in the editor.
-void ForceField::OnRender(iRender*, RenderPhase phase)
-{
-	if (phase != RenderPhase::Overlay || !transform) return;
-	if (enabled)
-	{
-		const unsigned long long fr = Time::getSingleton()->frame;
-		if (fr != bendSubmitFrame)   // OnRender fires per pass/camera — submit once
-		{
-			bendSubmitFrame = fr;
-			Vector3 c = transform->globalPosition();
-			BendVolume v;
-			v.pos[0] = (float)c.x; v.pos[1] = (float)c.y; v.pos[2] = (float)c.z;
-			v.radius = radius > 0.01f ? radius : 0.01f;
-			v.falloff = falloff;
-			switch (mode)
-			{
-				case 0:  v.mode = 1; v.strength = -strength; break;   // attract = inward radial
-				case 1:  v.mode = 1; v.strength = strength;  break;   // repel
-				case 2:  v.mode = 2; v.strength = strength;  break;   // vortex
-				default: v.mode = 3; v.strength = strength;  break;   // turbulence
-			}
-			BendVolumes::Submit(v);
-		}
-	}
-	AppInstance* app = AppInstance::GetSingleton();
-	if (!app->isEditor() || app->selectedInHieararchy != atom) return;
-	static const Color kModeCol[4] = { Color(0.4, 0.8, 1.0, 1.0),   // attract: blue
-	                                   Color(1.0, 0.5, 0.3, 1.0),   // repel: orange
-	                                   Color(0.7, 0.5, 1.0, 1.0),   // vortex: violet
-	                                   Color(0.5, 1.0, 0.6, 1.0) }; // turbulence: green
-	DebugDraw::WireSphere(transform->globalPosition(), radius, kModeCol[mode & 3]);
-}
-
-void ForceField::Update() {}
-void ForceField::FixedUpdate() {}
-void ForceField::Pause() {}
-void ForceField::Reset() {}
-
-// Snapshot of the enabled fields, taken once per frame so the sim jobs never touch the registry.
-struct FFSnap { int mode; float center[3]; float radius; float strength; float falloff; };
-static void SnapFields(std::vector<FFSnap>& out)
-{
-	boost::mutex::scoped_lock l(gFFLock);
-	out.clear();
-	for (ForceField* f : gFields)
-	{
-		if (!f || !f->enabled || !f->transform) continue;
-		Vector3 c = f->transform->globalPosition();
-		FFSnap s; s.mode = f->mode; s.center[0] = (float)c.x; s.center[1] = (float)c.y; s.center[2] = (float)c.z;
-		s.radius = f->radius > 0.01f ? f->radius : 0.01f; s.strength = f->strength; s.falloff = f->falloff;
-		out.push_back(s);
-	}
-}
 // Summed acceleration from every snapshotted field at world point `p`.
-static glm::vec3 FieldAccel(const std::vector<FFSnap>& fs, const glm::vec3& p, float seed, float t)
+static glm::vec3 FieldAccel(const std::vector<FFSnap>& fs, const glm::vec3& p, float seed, float t, float& wmax)
 {
-	glm::vec3 a(0);
+	glm::vec3 a(0); wmax = 0.f;
 	for (const FFSnap& f : fs)
 	{
 		glm::vec3 d = p - glm::vec3(f.center[0], f.center[1], f.center[2]);
 		float dist = glm::length(d);
 		if (dist > f.radius) continue;
 		float w = 1.0f - f.falloff * (dist / f.radius);
+		wmax = std::max(wmax, w);
 		glm::vec3 dir = dist > 1e-5f ? d / dist : glm::vec3(0, 1, 0);
 		switch (f.mode)
 		{
 			case 0: a -= dir * (f.strength * w); break;                        // attract
 			case 1: a += dir * (f.strength * w); break;                        // repel
-			case 2: a += glm::cross(glm::vec3(0, 1, 0), dir) * (f.strength * w); break;   // vortex around Y
+			case 2: a += glm::cross(glm::normalize(glm::vec3(f.axis[0], f.axis[1], f.axis[2])), dir) * (f.strength * w); break;   // vortex around the field's axis (world up unless Vortex Axis = Atom Up)
 			default:                                                           // turbulence
 			{
 				float s = f.strength * w;
@@ -642,7 +575,7 @@ void ParticleEmitter::Advance(float dt)
 		glm::vec3 pos(p.pos[0], p.pos[1], p.pos[2]);
 		glm::vec3 vel(p.vel[0], p.vel[1], p.vel[2]);
 		glm::vec3 acc(0, -g, 0);
-		acc += FieldAccel(fs, pos, p.seed, t);
+		float fw; acc += FieldAccel(fs, pos, p.seed, t, fw);
 		if (windI > 0.f) acc += (wind - vel) * windI;          // relax toward the wind vector
 		if (dragK > 0.f) acc -= vel * dragK;
 		vel += acc * dt;
@@ -868,6 +801,16 @@ void ParticleEmitter::ResolveAssets()
 		trailTexCache = trailTextureGuid.empty() ? nullptr : ResDB::getSingleton()->GetTexture(trailTextureGuid);
 		if (trailTextureGuid.empty() || trailTexCache) trailTexGuidRes = trailTextureGuid;
 	}
+	if (sixWayGuidA != sixAGuidRes)
+	{
+		sixACache = sixWayGuidA.empty() ? nullptr : ResDB::getSingleton()->GetTexture(sixWayGuidA);
+		if (sixWayGuidA.empty() || sixACache) sixAGuidRes = sixWayGuidA;
+	}
+	if (sixWayGuidB != sixBGuidRes)
+	{
+		sixBCache = sixWayGuidB.empty() ? nullptr : ResDB::getSingleton()->GetTexture(sixWayGuidB);
+		if (sixWayGuidB.empty() || sixBCache) sixBGuidRes = sixWayGuidB;
+	}
 }
 
 void ParticleEmitter::Draw(iRender* r)
@@ -1036,15 +979,22 @@ void ParticleEmitter::Draw(iRender* r)
 	if (!verts.empty() || !trailV.empty())
 	{
 		if (softFade > 0.f) r->setSpriteSoftDepth(softFade);
+		if (volumeLight > 0.f) r->setSpriteVolumeLight(volumeLight);   // lit by the froxel fog grid
 		// trail first: ribbons sit BEHIND their particles
 		if (!trailV.empty())
 			r->drawSpriteRun(trailTexCache, trailV.data(), (int)trailV.size() / 9);
 		if (!verts.empty())
 		{
-			// built-in procedural shape when no texture asset is assigned (Quad = plain white)
-			Texture* baseTex = texCache ? texCache : ShapeTex(spriteShape);
-			r->drawSpriteRun(baseTex, verts.data(), (int)verts.size() / 9);
+			if (sixWay && sixACache && sixBCache)   // hero smoke: six-way lightmaps, lit by the scene lights
+				r->drawSpriteRunSixWay(sixACache, sixBCache, verts.data(), (int)verts.size() / 9);
+			else
+			{
+				// built-in procedural shape when no texture asset is assigned (Quad = plain white)
+				Texture* baseTex = texCache ? texCache : ShapeTex(spriteShape);
+				r->drawSpriteRun(baseTex, verts.data(), (int)verts.size() / 9);
+			}
 		}
+		if (volumeLight > 0.f) r->setSpriteVolumeLight(0.f);
 		if (softFade > 0.f) r->setSpriteSoftDepth(0.f);   // restore: other sprite users stay hard
 	}
 }

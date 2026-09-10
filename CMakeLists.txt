@@ -20,12 +20,14 @@ add_custom_command(
     OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeVFX.gen.inc"
     COMMAND "${NUKE_GEN}"
             --module "${CMAKE_CURRENT_SOURCE_DIR}"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/include/NukeVFX/Particles.h" "${NUKE_GEN}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/include/NukeVFX/Particles.h" "${CMAKE_CURRENT_SOURCE_DIR}/include/NukeVFX/ScatterVolume.h" "${CMAKE_CURRENT_SOURCE_DIR}/include/NukeVFX/FogVolume.h" "${NUKE_GEN}"
     COMMENT "nukegen: NukeVFX reflection")
 
 add_library(NukeVFX SHARED
     src/NukeVFX.cpp
     src/Particles.cpp
+    src/ScatterVolume.cpp
+    src/FogVolume.cpp
     
     "${CMAKE_CURRENT_SOURCE_DIR}/src/NukeVFX.gen.inc"
 )

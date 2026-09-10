@@ -1,5 +1,6 @@
 // NukeVFX — particle/VFX module entry point; model + sim + rendering live in Particles.h/.cpp.
 #include <NukeVFX/Particles.h>
+#include <NukeVFX/FogVolume.h>   // ScatterVolume + FogVolume: the media of the World's volumetric grid
 
 #include <interface/NUKEEInteface.h>
 #include <interface/AtomCreators.h>   // "+"-menu atom templates (editor builds the menu from this)
@@ -25,12 +26,14 @@ public:
 
 	void OnLoad() override
 	{
-		NukeReflectInit_NukeVFX();   // ParticleEmitter/ForceField become Add Component-able / scriptable
+		NukeReflectInit_NukeVFX();   // ParticleEmitter / ScatterVolume / FogVolume become Add Component-able / scriptable (ForceField lives in the engine)
 
 		RegisterAtomCreator({ "Effects", "Particle Emitter", "" /* ICON_LC_SPARKLES */, { "ParticleEmitter" } });
-		RegisterAtomCreator({ "Effects", "Force Field",      "" /* ICON_LC_MAGNET */,   { "ForceField" } });
 		RegisterComponentIcon({ "ParticleEmitter", "" /* ICON_LC_SPARKLES */, { 1.0f, 0.75f, 0.35f, 0.92f } });
-		RegisterComponentIcon({ "ForceField",      "" /* ICON_LC_MAGNET */,   { 0.55f, 0.82f, 1.0f, 0.92f } });
+		RegisterAtomCreator({ "Effects", "Scatter Volume", "" /* ICON_LC_SUN */, { "ScatterVolume" } });   // clear air that scatters the lights (rays / cones)
+		RegisterAtomCreator({ "Effects", "Fog Volume", "" /* ICON_LC_CLOUD_FOG */, { "FogVolume" } });
+		RegisterComponentIcon({ "FogVolume", "" /* ICON_LC_CLOUD_FOG */, { 0.78f, 0.82f, 0.9f, 0.92f } });
+		RegisterComponentIcon({ "ScatterVolume", "" /* ICON_LC_SUN */, { 0.95f, 0.9f, 0.7f, 0.92f } });
 		std::cout << "[NukeVFX]\tloaded" << std::endl;
 	}
 
