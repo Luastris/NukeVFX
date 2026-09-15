@@ -1048,14 +1048,19 @@ void ParticleEmitter::Draw(iRender* r)
 			r->drawSpriteRun(trailTexCache, trailV.data(), (int)trailV.size() / 9);
 		if (!verts.empty())
 		{
+			// Built-in Shape: the sprite itself when no texture is assigned, an alpha MASK over
+			// the texture (or the six-way maps) when one is (Quad = no mask).
+			Texture* shapeTex = ShapeTex(spriteShape);
+			Texture* mask = (texCache || (sixWay && sixACache && sixBCache)) ? shapeTex : nullptr;
+			if (mask) r->setSpriteMask(mask);
 			if (sixWay && sixACache && sixBCache)   // hero smoke: six-way lightmaps, lit by the scene lights
 				r->drawSpriteRunSixWay(sixACache, sixBCache, verts.data(), (int)verts.size() / 9);
 			else
 			{
-				// built-in procedural shape when no texture asset is assigned (Quad = plain white)
-				Texture* baseTex = texCache ? texCache : ShapeTex(spriteShape);
+				Texture* baseTex = texCache ? texCache : shapeTex;
 				r->drawSpriteRun(baseTex, verts.data(), (int)verts.size() / 9);
 			}
+			if (mask) r->setSpriteMask(nullptr);
 		}
 		if (volumeLight > 0.f) r->setSpriteVolumeLight(0.f);
 		if (softFade > 0.f) r->setSpriteSoftDepth(0.f);   // restore: other sprite users stay hard
@@ -1129,6 +1134,7 @@ void ParticleEmitter::BuildRTQuads(iRender* r)
 			rtMesh->rtColorArray = new float[(size_t)cap * 24]();   // float4 x 6 verts per quad
 			rtMesh->rtDynamic     = true;   // renderer rebuilds the BLAS every frame
 			rtMesh->rtAlphaTested = true;   // rays alpha-test texture x particle fade
+			rtMesh->rtSprite      = true;   // procedural: every ray sees the quad turned toward itself
 			// Canonical quad UVs: registered ONCE in the RT concat buffers; world.ps reconstructs
 			// these exact values analytically, so they must never change.
 			static const float qu[12] = { 0,1, 1,1, 1,0, 0,1, 1,0, 0,0 };
@@ -1190,6 +1196,7 @@ void ParticleEmitter::BuildRTQuads(iRender* r)
 			Texture* baseTex = texCache ? texCache : ShapeTex(spriteShape);
 			rtMat->diff  = baseTex;
 			rtMat->em    = baseTex;
+			rtMat->mask  = texCache ? ShapeTex(spriteShape) : nullptr;   // the Shape masks the texture, as in the raster
 			rtMat->color = Color(0, 0, 0, alphaN ? (double)(alphaSum / alphaN) : 1.0);   // a = shadow gate
 			rtMat->metallic = 0.f; rtMat->roughness = 1.f; rtMat->specular = 0.f;
 			rtMat->emissive = Color(1, 1, 1, 1);
@@ -1218,6 +1225,7 @@ void ParticleEmitter::BuildRTQuads(iRender* r)
 			rtTrailMesh->rtColorArray = new float[(size_t)tcap * 24]();
 			rtTrailMesh->rtDynamic     = true;
 			rtTrailMesh->rtAlphaTested = true;
+			rtTrailMesh->rtSprite      = true;   // ribbon segments rotate about their axis toward each ray
 			rtTrailMesh->rtShadowShape = 2;   // ribbon: strip across u
 			for (int i = 0; i < tcap * 6; ++i)
 			{ rtTrailMesh->normalArray[i * 3] = 0.f; rtTrailMesh->normalArray[i * 3 + 1] = 0.f; rtTrailMesh->normalArray[i * 3 + 2] = 1.f; }
