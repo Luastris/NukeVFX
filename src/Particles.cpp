@@ -379,6 +379,9 @@ void ParticleEmitter::FreeRTMesh()
 {
 	FreeOneRTMesh(rtMesh, rtMat, rtCap);
 	FreeOneRTMesh(rtTrailMesh, rtTrailMat, rtTrailCap);
+	delete meshTexMat; meshTexMat = nullptr;
+	delete meshGbufMat; meshGbufMat = nullptr;
+	delete matCache; matCache = nullptr; matGuidRes.clear();
 }
 
 void ParticleEmitter::Update()
@@ -684,13 +687,18 @@ void ParticleEmitter::Advance(float dt)
 			glm::vec3 wp2(p.pos[0], p.pos[1], p.pos[2]);
 			if (localSpace) wp2 = glm::vec3(l2w * glm::vec4(wp2, 1));
 			const double lvl = wq->HeightAt(wp2.x, wp2.z);
-			if (lvl > -1e8 && wp2.y <= (float)lvl)
-			{
+			const bool under = lvl > -1e8 && wp2.y <= (float)lvl;
+			if (under && p.wet < 0.5f)
+			{   // the ENTRY splashes, once: a bouncing particle re-entering every frame pumped the
+				// ripple field hundreds of times a second. Strength = the particle's momentum
+				// (size^2 x speed), not a constant: a spark moves no water, debris does.
 				const float hp3[3] = { wp2.x, (float)lvl, wp2.z };
-				wq->Splash(hp3, p.size * 0.9f + 0.12f, 0.15f + fabsf(p.vel[1]) * 0.05f);
+				const float mom = p.size * p.size * (0.5f + fabsf(p.vel[1]) * 0.25f);
+				wq->Splash(hp3, p.size * 0.9f + 0.12f, std::min(mom, 0.6f));
 				if (dieOnWater) dead = true;
 				else p.vel[1] = fabsf(p.vel[1]) * 0.25f;   // damped pop back out
 			}
+			p.wet = under ? 1.0f : 0.0f;
 		}
 		if (dead)
 		{
@@ -725,8 +733,73 @@ void ParticleEmitter::Advance(float dt)
 
 // ---- rendering ----------------------------------------------------------------------------
 
+// Mesh mode: this frame's instance records (transform, colour, life/seed) into the instance
+// buffer; the G-buffer prepass and the colour pass draw the same set.
+int ParticleEmitter::UploadMeshInstances(iRender* r)
+{
+	if (!r || !meshCache || parts.empty()) return 0;
+	if (instBuf && instOwner != r) { instBuf = 0; instOwner = nullptr; }
+	if (!instBuf) { instBuf = r->createInstanceBuffer(); instOwner = r; }
+	if (!instBuf) return 0;
+	glm::mat4 l2w(1.0f);
+	if (localSpace && transform)
+	{
+		Vector3 cp = transform->globalPosition(); Quaternion Q = transform->globalRotation();
+		l2w = glm::translate(glm::mat4(1.f), glm::vec3((float)cp.x, (float)cp.y, (float)cp.z)) * glm::mat4_cast(glm::quat((float)Q.w, (float)Q.x, (float)Q.y, (float)Q.z));
+	}
+	static std::vector<NukeInstanceData> recs; recs.clear(); recs.reserve(parts.size());
+	for (const P& p : parts)
+	{
+		float lt = 1.f - p.life / p.maxLife;
+		float sz = p.size * EvalCurve(sizeOverLife, lt, 1.f);
+		glm::vec3 wp(p.pos[0], p.pos[1], p.pos[2]);
+		if (localSpace) wp = glm::vec3(l2w * glm::vec4(wp, 1));
+		glm::mat4 w = glm::translate(glm::mat4(1.f), wp)
+		            * glm::mat4_cast(glm::angleAxis(p.rot, glm::normalize(glm::vec3(0.3f, 1, 0.2f))))
+		            * glm::scale(glm::mat4(1.f), glm::vec3(sz));
+		NukeInstanceData rec;
+		for (int k = 0; k < 4; ++k) rec.row0[k] = w[k][0];
+		for (int k = 0; k < 4; ++k) rec.row1[k] = w[k][1];
+		for (int k = 0; k < 4; ++k) rec.row2[k] = w[k][2];
+		float rgb[3] = { (float)startColor.r, (float)startColor.g, (float)startColor.b };
+		EvalGradient(colorGradient, lt, rgb);
+		const float gEffM = glow * EvalCurve(glowOverLife, lt, 1.f);
+		if (gEffM > 0.f) { const float g = 1.f + gEffM; rgb[0] *= g; rgb[1] *= g; rgb[2] *= g; }   // HDR boost -> bloom
+		rec.color[0] = rgb[0]; rec.color[1] = rgb[1]; rec.color[2] = rgb[2];
+		rec.color[3] = (float)startColor.a * Clamp01(EvalCurve(alphaOverLife, lt, 1.f));
+		rec.custom[0] = lt; rec.custom[1] = p.seed;
+		recs.push_back(rec);
+	}
+	r->updateInstanceBuffer(instBuf, recs.data(), (int)recs.size());
+	return (int)recs.size();
+}
+
 void ParticleEmitter::OnRender(iRender* r, RenderPhase phase)
 {
+	// Mesh particles are opaque geometry: they belong to the G-buffer prepass like any mesh
+	// (depth for the reflections' composite, the soft particles, TAA; normal/roughness for
+	// screen-space and ray-traced reflections OF them).
+	if (phase == RenderPhase::GBuffer && r && transform)
+	{
+		const int baseMode = renderMode == 2 ? 0 : renderMode;
+		if (baseMode == 3 && meshCache)
+		{
+			ResolveAssets();
+			const int n = UploadMeshInstances(r);
+			// Particles are effects, not reflectors: the G-buffer sees them fully rough, so the
+			// reflection tracer never paints mirror images ON them (they still appear IN reflections
+			// through the TLAS, with their own material and colour).
+			if (n > 0)
+			{
+				Material* src = MeshMaterial();
+				if (!meshGbufMat) meshGbufMat = new Material();
+				if (meshGbufMat->diff != src->diff) { meshGbufMat->diff = src->diff; meshGbufMat->norm = src->norm; }
+				meshGbufMat->color = src->color; meshGbufMat->metallic = 0.f; meshGbufMat->roughness = 1.f; meshGbufMat->specular = 0.f;
+				r->renderGBufferInstanced(meshCache, meshGbufMat, instBuf, 0, n);
+			}
+		}
+		return;
+	}
 	// Selected-emitter gizmo (editor): the emission shape as wire geometry.
 	if (phase == RenderPhase::Overlay && transform)
 	{
@@ -779,6 +852,21 @@ void ParticleEmitter::OnRender(iRender* r, RenderPhase phase)
 
 // Re-resolves the asset caches whenever their guid prop changed; a failed resolve stores no
 // guid, so a not-yet-loaded asset is retried next frame.
+// Mesh mode's material: the Mesh Material asset when set, else the Texture prop as a plain
+// albedo (white, rough) - what the inspector's Texture field means when the particle is a mesh.
+Material* ParticleEmitter::MeshMaterial()
+{
+	if (matCache) { matCache->Resolve(); return matCache; }   // late-loaded textures bind on their first use
+	if (!meshTexMat) meshTexMat = new Material();
+	if (meshTexMat->diff != texCache)
+	{
+		meshTexMat->diff = texCache;
+		meshTexMat->color = Color(1, 1, 1, 1);
+		meshTexMat->metallic = 0.f; meshTexMat->roughness = 0.8f; meshTexMat->specular = 0.5f;
+	}
+	return meshTexMat;
+}
+
 void ParticleEmitter::ResolveAssets()
 {
 	if (textureGuid != texGuidRes)
@@ -793,7 +881,11 @@ void ParticleEmitter::ResolveAssets()
 	}
 	if (materialGuid != matGuidRes)
 	{
-		matCache = materialGuid.empty() ? nullptr : ResDB::getSingleton()->GetMaterial(materialGuid);
+		// An owned clone, like MeshRenderer: the ResDB asset is a template whose texture pointers
+		// are never bound; Resolve() binds this instance's maps from their guids.
+		if (matCache) { delete matCache; matCache = nullptr; }
+		Material* asset = materialGuid.empty() ? nullptr : ResDB::getSingleton()->GetMaterial(materialGuid);
+		if (asset) { matCache = asset->Clone(); matCache->Resolve(); }
 		if (materialGuid.empty() || matCache) matGuidRes = materialGuid;
 	}
 	if (trailTextureGuid != trailTexGuidRes)
@@ -835,41 +927,12 @@ void ParticleEmitter::Draw(iRender* r)
 		l2w = glm::translate(glm::mat4(1.f), glm::vec3((float)cp.x, (float)cp.y, (float)cp.z)) * glm::mat4_cast(glm::quat((float)Q.w, (float)Q.x, (float)Q.y, (float)Q.z));
 	}
 
-	// MESH mode: pack instance records, one instanced draw; falls through when a trail is on.
+	// MESH mode: one instanced draw; falls through when a trail is on.
 	bool meshDrawn = false;
 	if (baseMode == 3 && meshCache)
 	{
-		if (instBuf && instOwner != r) { instBuf = 0; instOwner = nullptr; }
-		if (!instBuf) { instBuf = r->createInstanceBuffer(); instOwner = r; }
-		if (instBuf)
-		{
-		static std::vector<NukeInstanceData> recs; recs.clear(); recs.reserve(parts.size());
-		for (const P& p : parts)
-		{
-			float lt = 1.f - p.life / p.maxLife;
-			float sz = p.size * EvalCurve(sizeOverLife, lt, 1.f);
-			glm::vec3 wp(p.pos[0], p.pos[1], p.pos[2]);
-			if (localSpace) wp = glm::vec3(l2w * glm::vec4(wp, 1));
-			glm::mat4 w = glm::translate(glm::mat4(1.f), wp)
-			            * glm::mat4_cast(glm::angleAxis(p.rot, glm::normalize(glm::vec3(0.3f, 1, 0.2f))))
-			            * glm::scale(glm::mat4(1.f), glm::vec3(sz));
-			NukeInstanceData rec;
-			for (int k = 0; k < 4; ++k) rec.row0[k] = w[k][0];
-			for (int k = 0; k < 4; ++k) rec.row1[k] = w[k][1];
-			for (int k = 0; k < 4; ++k) rec.row2[k] = w[k][2];
-			float rgb[3] = { (float)startColor.r, (float)startColor.g, (float)startColor.b };
-			EvalGradient(colorGradient, lt, rgb);
-			const float gEffM = glow * EvalCurve(glowOverLife, lt, 1.f);
-			if (gEffM > 0.f) { const float g = 1.f + gEffM; rgb[0] *= g; rgb[1] *= g; rgb[2] *= g; }   // HDR boost -> bloom
-			rec.color[0] = rgb[0]; rec.color[1] = rgb[1]; rec.color[2] = rgb[2];
-			rec.color[3] = (float)startColor.a * Clamp01(EvalCurve(alphaOverLife, lt, 1.f));
-			rec.custom[0] = lt; rec.custom[1] = p.seed;
-			recs.push_back(rec);
-		}
-		r->updateInstanceBuffer(instBuf, recs.data(), (int)recs.size());
-		r->renderObjectInstanced(meshCache, matCache, instBuf, 0, (int)recs.size());
-		meshDrawn = true;
-		}
+		const int n = UploadMeshInstances(r);
+		if (n > 0) { r->renderObjectInstanced(meshCache, MeshMaterial(), instBuf, 0, n); meshDrawn = true; }
 	}
 	if (baseMode == 3 && !wantTrail) return;
 	(void)meshDrawn;
@@ -1024,6 +1087,7 @@ void ParticleEmitter::BuildRTQuads(iRender* r)
 	const int   n   = (int)parts.size() < cap ? (int)parts.size() : cap;
 	float alphaSum = 0.f; int alphaN = 0;
 
+
 	// ---- MESH mode: one TLAS instance per particle over the asset mesh (cached BLAS) ----
 	if (baseMode == 3 && meshCache)
 	{
@@ -1040,7 +1104,12 @@ void ParticleEmitter::BuildRTQuads(iRender* r)
 			float pos[3]   = { wp.x, wp.y, wp.z };
 			float quat[4]  = { q.x, q.y, q.z, q.w };
 			float scale[3] = { sz, sz, sz };
-			r->addRTInstance(meshCache, matCache, pos, quat, scale, inReflections, castShadows);
+			// The same colour the raster instance carries: gradient + glow, alpha = fade.
+			float tint[4] = { (float)startColor.r, (float)startColor.g, (float)startColor.b, a };
+			EvalGradient(colorGradient, lt, tint);
+			const float gEffR = glow * EvalCurve(glowOverLife, lt, 1.f);
+			if (gEffR > 0.f) { const float g = 1.f + gEffR; tint[0] *= g; tint[1] *= g; tint[2] *= g; }
+			r->addRTInstanceTinted(meshCache, MeshMaterial(), pos, quat, scale, tint, inReflections, castShadows);
 		}
 	}
 

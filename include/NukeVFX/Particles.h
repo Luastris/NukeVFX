@@ -128,7 +128,7 @@ public:
 	[[nuke::func]] int  AliveCount();
 
 	// ---- runtime ---------------------------------------------------------------------------
-	struct P { float pos[3]; float vel[3]; float life; float maxLife; float size; float rot; float rotVel; float seed; };
+	struct P { float pos[3]; float vel[3]; float life; float maxLife; float size; float rot; float rotVel; float seed; float wet = 0.0f; };   // wet: below the water surface last step (a splash is an ENTRY, not every frame)
 	std::vector<P> parts;               // alive particles (swap-erase on death)
 	float emitAccum = 0.f, burstAccum = 0.f, ageSec = 0.f;
 	double lastPos[3] = { 0, 0, 0 }; bool hasLastPos = false;   // atom velocity (inherit)
@@ -140,6 +140,10 @@ public:
 	// Asset caches track the guid they were resolved FROM — never latch, a changed/cleared
 	// prop must re-resolve on the next draw.
 	Texture* texCache = nullptr; Mesh* meshCache = nullptr; Material* matCache = nullptr;
+	Material* meshTexMat = nullptr;   // Mesh mode without a Mesh Material: the Texture prop as albedo (owned)
+	Material* meshGbufMat = nullptr;  // the G-buffer prepass copy: fully rough (reflections are traced on water/mirrors, not on particles)
+	Material* MeshMaterial();
+	int UploadMeshInstances(iRender* r);   // Mesh mode: pack + upload this frame's instance records (count)
 	Texture* trailTexCache = nullptr;
 	Texture* sixACache = nullptr; Texture* sixBCache = nullptr;
 	std::string texGuidRes, meshGuidRes, matGuidRes, trailTexGuidRes, sixAGuidRes, sixBGuidRes;
