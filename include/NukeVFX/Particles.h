@@ -41,9 +41,10 @@ public:
 	[[nuke::prop(label="Burst Count", min=0, tip="Particles per burst (0 = no bursts).")]] int burstCount = 0;
 	[[nuke::prop(label="Burst Interval", min=0.01)]]    float burstInterval = 1.0f;
 	// ---- shape -----------------------------------------------------------------------------
-	[[nuke::prop(label="Shape", enum="Point,Sphere,Box,Cone,MeshSurface")]] int shape = 1;
+	[[nuke::prop(label="Shape", enum="Point,Sphere,Box,Cone,MeshSurface,CameraBox", tip="CameraBox: a box that rides the MAIN camera (Shape Extents around Camera Offset), particles spawn falling - rain, snow, wind-blown dust around the viewer.")]] int shape = 1;
 	[[nuke::prop(label="Shape Radius", min=0)]]         float shapeRadius = 0.5f;      // sphere/cone base
 	[[nuke::prop(label="Shape Extents")]]               Vector3 shapeExtents = Vector3(0.5, 0.5, 0.5);   // box half
+	[[nuke::prop(label="Camera Offset", tip="CameraBox: the box centre relative to the camera - x right, y up, z ahead (flattened).")]] Vector3 cameraOffset = Vector3(0, 6, 4);
 	[[nuke::prop(label="Cone Angle", min=0, max=89)]]   float coneAngle = 25.0f;       // deg from +Y
 	[[nuke::prop(label="From Shell", tip="Emit from the shape surface instead of the volume.")]] bool fromShell = false;
 	[[nuke::prop(asset="mesh", label="Emit Mesh", tip="MeshSurface shape: emit from this mesh's triangles. Empty = this atom's own rendered mesh, else the parent atom's (prefab flames riding a burning object).")]] std::string emitMeshGuid;

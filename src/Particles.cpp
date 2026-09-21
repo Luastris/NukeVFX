@@ -15,6 +15,7 @@
 #include <API/Model/Events.h>         // vfx.collision events (point/normal/atom/uv)
 #include <API/Model/Surface.h>        // LiveMaterial hit reactions on collision
 #include <API/Model/World.h>          // editor-preview World-mode collision scans the scene
+#include <API/Model/Camera.h>         // CameraBox shape: the spawn volume rides the main camera
 #include <interface/AppInstance.h>
 #include <render/irender.h>
 #include <glm/glm.hpp>
@@ -412,6 +413,20 @@ void ParticleEmitter::BurstAt(const Vector3& worldPos, double count)
 	glm::vec3 base((float)worldPos.x, (float)worldPos.y, (float)worldPos.z);
 	Quaternion Q = transform->globalRotation();
 	glm::quat rot((float)Q.w, (float)Q.x, (float)Q.y, (float)Q.z);
+	// CameraBox: the spawn volume rides the MAIN camera - x right, y up, z ahead (flattened),
+	// so a rain/snow box hangs over and in front of the viewer wherever the camera looks.
+	glm::vec3 camP(0), camR(1, 0, 0), camF(0, 0, 1); bool camOK = false;
+	if (shape == 5)
+		if (World* wl = AppInstance::GetSingleton()->currentWorld)
+			if (Camera* cam = wl->GetMainCamera(); cam && cam->transform)
+			{
+				Vector3 cp = cam->transform->globalPosition(), cf = cam->transform->forward();
+				camP = glm::vec3((float)cp.x, (float)cp.y, (float)cp.z);
+				glm::vec3 f((float)cf.x, 0.0f, (float)cf.z);
+				if (glm::length(f) > 1e-4f) camF = glm::normalize(f);
+				camR = glm::normalize(glm::cross(glm::vec3(0, 1, 0), camF));
+				camOK = true;
+			}
 	Mesh* emitMesh = nullptr;
 	if (shape == 4 && !emitMeshGuid.empty()) emitMesh = ResDB::getSingleton()->GetMesh(emitMeshGuid);
 	// No authored mesh: emit from the atom's own rendered mesh, else the parent's (prefab
@@ -456,6 +471,16 @@ void ParticleEmitter::BurstAt(const Vector3& worldPos, double count)
 				lp = glm::vec3(Rnd(-1, 1) * (float)shapeExtents.x, Rnd(-1, 1) * (float)shapeExtents.y, Rnd(-1, 1) * (float)shapeExtents.z);
 				dir = glm::vec3(0, 1, 0);
 				break;
+			case 5:   // camera box: world-space around the main camera, spawn falling
+			{
+				glm::vec3 r(Rnd(-1, 1) * (float)shapeExtents.x + (float)cameraOffset.x,
+				            Rnd(-1, 1) * (float)shapeExtents.y + (float)cameraOffset.y,
+				            Rnd(-1, 1) * (float)shapeExtents.z + (float)cameraOffset.z);
+				if (camOK) { lp = camP + camR * r.x + glm::vec3(0, r.y, 0) + camF * r.z; worldSample = true; }
+				else lp = r;   // no main camera (previews): the box sits at the atom
+				dir = glm::vec3(0, -1, 0);
+				break;
+			}
 			case 3:   // cone from +Y
 			{
 				float ang = coneAngle * 0.0174533f * (fromShell ? 1.f : sqrtf((float)Rand::Value("vfx")));
@@ -816,6 +841,7 @@ void ParticleEmitter::OnRender(iRender* r, RenderPhase phase)
 				case 0: DebugDraw::WireSphere(gp, 0.12, gc); break;                                   // point
 				case 1: DebugDraw::WireSphere(gp, shapeRadius, gc); break;                            // sphere
 				case 2: DebugDraw::WireBox(gp, shapeExtents, gq, gc); break;                          // box
+				case 5: DebugDraw::WireBox(gp + cameraOffset, shapeExtents, Quaternion(0, 0, 0, 1), gc); break;   // camera box (shown at the atom)
 				case 3:                                                                                // cone
 					DebugDraw::WireCone(gp, Vector3(gup.x, gup.y, gup.z), coneAngle,
 					                    std::max(1.0f, (speedMin + speedMax) * 0.35f), gc);
