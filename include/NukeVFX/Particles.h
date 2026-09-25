@@ -165,6 +165,7 @@ public:
 	void Init(Atom* parent) override;
 	void Destroy() override;
 	void Update() override;              // sim step (playing)
+	TimeDomain timeDomain() const override { return TimeDomain::Particles; }   // TimeVolume's "Particles" switch
 	void FixedUpdate() override;
 	void Pause() override;
 	void Reset() override;
