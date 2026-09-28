@@ -63,6 +63,8 @@ public:
 	[[nuke::prop(label="Gravity", section="Forces", tip="Multiplier of world gravity.")]] float gravity = 0.0f;
 	[[nuke::prop(label="Drag", min=0)]]                 float drag = 0.0f;
 	[[nuke::prop(label="Wind Influence", min=0, max=1)]] float windInfluence = 0.0f;   // nuke::Wind::Sample
+	[[nuke::prop(label="Fog Drag", min=0, tip="Fluid fog carries the particles: how fast (per second) a particle takes the fog's motion - the air of a Fluid volume, the Force Fields' drift and a vortex's funnel - scaled by the fog's fullness there. 0 = off, ~3 = smoke riding the fog (the default).")]] float fogDrag = 3.0f;
+	[[nuke::prop(label="Fog Clumping", min=0, tip="Fluid fog draws the particles into its denser parts - clumps and a vortex's arms: acceleration per unit of fullness gradient (m/s^2 per 1/m). 0 = off.")]] float fogClump = 6.0f;
 	// ---- collision -------------------------------------------------------------------------
 	[[nuke::prop(label="Collision", section="Collision", enum="Off,World,Surface", tip="World = everything (physics). Surface = only the referenced atom's meshes.")]] int collision = 0;
 	[[nuke::prop(label="Surface", tip="Surface mode: the one atom (subtree) particles collide with.")]] Atom* collisionSurface = nullptr;
@@ -92,6 +94,7 @@ public:
 	[[nuke::prop(label="Trail Width Over Life", widget="curve", min=0, tip="Multiplier of Trail Width over life.")]] std::vector<float> trailWidthOverLife;
 	[[nuke::prop(label="Light Over Life", widget="curve", min=0, tip="Multiplier of the particle light's intensity over life (on top of Glow Over Life).")]] std::vector<float> lightOverLife;
 	[[nuke::prop(label="Light Radius Over Life", widget="curve", min=0, tip="Multiplier of Light Radius over life.")]] std::vector<float> lightRadiusOverLife;
+	[[nuke::prop(label="Fog Drag Over Life", widget="curve", min=0, tip="Multiplier of Fog Drag over life.")]] std::vector<float> fogDragOverLife;
 
 	[[nuke::prop(label="Color Gradient", widget="gradient")]] std::vector<float> colorGradient; // (t,r,g,b) stops
 	[[nuke::prop(label="Start Color")]]                 Color startColor = Color(1, 1, 1, 1);
@@ -139,6 +142,7 @@ public:
 	[[nuke::func]] void Burst(double count);    // immediate burst at the emitter
 	[[nuke::func]] void BurstAt(const Vector3& worldPos, double count);   // burst at a point (sub-emitter channel)
 	[[nuke::func]] int  AliveCount();
+	[[nuke::func]] Vector3 ParticlePos(double i);   // world position of alive particle i (0..AliveCount-1); zero when out of range
 
 	// ---- runtime ---------------------------------------------------------------------------
 	struct P { float pos[3]; float vel[3]; float life; float maxLife; float size; float rot; float rotVel; float seed; float wet = 0.0f; };   // wet: below the water surface last step (a splash is an ENTRY, not every frame)

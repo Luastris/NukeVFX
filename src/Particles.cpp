@@ -1,4 +1,4 @@
-// NukeVFX — simulation + rendering (see include/NukeVFX/Particles.h for the model).
+﻿// NukeVFX вЂ” simulation + rendering (see include/NukeVFX/Particles.h for the model).
 #include <NukeVFX/Particles.h>
 #include <API/Model/resdb.h>
 #include <API/Model/Jobs.h>
@@ -25,6 +25,8 @@
 #include <cmath>
 #include <cstring>
 #include <cfloat>   // FLT_MAX (scene snapshot AABBs)
+#include <cstdlib>  // getenv (NUKE_VFX_DEBUG)
+#include <iostream>
 
 using namespace nuke;
 
@@ -34,8 +36,103 @@ namespace nuke {
 typedef ForceFieldSnap FFSnap;
 static void SnapFields(std::vector<FFSnap>& out) { ForceField::Snapshot(out); }
 
-// Summed acceleration from every snapshotted field at world point `p`.
-static glm::vec3 FieldAccel(const std::vector<FFSnap>& fs, const glm::vec3& p, float seed, float t, float& wmax)
+static glm::vec3 FunnelVelocity(const FFSnap& f, const glm::vec3& d, float w);   // below
+
+// Trilinear sample of a cell-centred grid (`n` cells over the unit cube per axis, `comps` per cell).
+static void TriSample(const float* g, const int* n, int comps, const glm::vec3& uvw, float* out)
+{
+	float fx[3]; int i0[3], i1[3];
+	for (int a = 0; a < 3; ++a)
+	{
+		float f = uvw[a] * (float)n[a] - 0.5f; f = std::max(0.f, std::min((float)n[a] - 1.f, f));
+		i0[a] = (int)f; i1[a] = std::min(i0[a] + 1, n[a] - 1); fx[a] = f - (float)i0[a];
+	}
+	for (int c = 0; c < comps; ++c) out[c] = 0.f;
+	for (int k = 0; k < 8; ++k)
+	{
+		const int ix = (k & 1) ? i1[0] : i0[0], iy = (k & 2) ? i1[1] : i0[1], iz = (k & 4) ? i1[2] : i0[2];
+		const float w = ((k & 1) ? fx[0] : 1.f - fx[0]) * ((k & 2) ? fx[1] : 1.f - fx[1]) * ((k & 4) ? fx[2] : 1.f - fx[2]);
+		const float* cell = g + (((size_t)iz * n[1] + iy) * n[0] + ix) * comps;
+		for (int c = 0; c < comps; ++c) out[c] += cell[c] * w;
+	}
+}
+// The fog's motion at a world point (Fog Drag): the fluid volumes' air (box-local -> world), the
+// Force Fields' drift (attract / repel over the fog's response time, as vol_fluid.cs FieldDrift) and
+// a vortex's funnel - the exact law the fog is shaped with (omega = s * falloff / max(r, inner),
+// pull > 0 in at the pull speed, < 0 out r-proportionally). False outside every fluid volume;
+// `fullness` = the fog's density there, 0..1.
+static bool FogMotionAt(const std::vector<std::shared_ptr<const NukeFogFluidCpu>>& fogs, const std::vector<FFSnap>& fs,
+                        const glm::vec3& p, glm::vec3& v, float& fullness, glm::vec3& grad)
+{
+	v = glm::vec3(0); fullness = 0.f; grad = glm::vec3(0);
+	bool inside = false;
+	for (const auto& f : fogs)
+	{
+		if (!f || f->vel.empty() || f->rho.empty()) continue;
+		const glm::quat q((float)f->rot[3], (float)f->rot[0], (float)f->rot[1], (float)f->rot[2]);
+		const glm::vec3 he(f->halfExt[0], f->halfExt[1], f->halfExt[2]);
+		const glm::vec3 l = glm::conjugate(q) * (p - glm::vec3(f->pos[0], f->pos[1], f->pos[2]));
+		if (fabsf(l.x) > he.x || fabsf(l.y) > he.y || fabsf(l.z) > he.z) continue;
+		const glm::vec3 uvw = (l + he) / (2.f * he);
+		float lv[3], r;
+		TriSample(f->vel.data(), f->vr, 3, uvw, lv);
+		TriSample(f->rho.data(), f->rr, 1, uvw, &r);
+		v += q * glm::vec3(lv[0], lv[1], lv[2]);
+		fullness = std::max(fullness, r);
+		// the fullness gradient (per metre, world): where the fog is denser - its clumps and the funnel's arms
+		{
+			glm::vec3 g(0);
+			for (int a = 0; a < 3; ++a)
+			{
+				const float cell = 2.f * he[a] / (float)std::max(f->rr[a], 1);
+				glm::vec3 u0 = uvw, u1 = uvw; u0[a] -= 0.5f / (float)std::max(f->rr[a], 1); u1[a] += 0.5f / (float)std::max(f->rr[a], 1);
+				float r0, r1; TriSample(f->rho.data(), f->rr, 1, u0, &r0); TriSample(f->rho.data(), f->rr, 1, u1, &r1);
+				g[a] = (r1 - r0) / cell;
+			}
+			grad += q * g;
+		}
+		inside = true;
+	}
+	if (!inside) return false;
+	for (const FFSnap& f : fs)
+	{
+		const glm::vec3 c(f.center[0], f.center[1], f.center[2]);
+		const glm::vec3 d = p - c; const float l = glm::length(d), R = f.radius;
+		if (l >= R) continue;
+		const float w = 1.f - f.falloff * (l / R);
+		const glm::vec3 dir = l > 1e-5f ? d / l : glm::vec3(0, 1, 0);
+		if (f.mode == 0 || f.mode == 1)
+		{
+			glm::vec3 a = dir * (f.strength * w * (f.mode == 0 ? -1.f : 1.f) * 0.35f);   // the fog's response time
+			const float m = glm::length(a); if (m > 15.f) a *= 15.f / m;
+			v += a;
+		}
+		else if (f.mode == 2)
+		{   // the funnel: the fog's own motion in a vortex (the law its arms are shaped with)
+			const float wf = (1.f - glm::smoothstep(0.7f, 1.f, l / R)) * glm::smoothstep(0.f, 0.6f, 1.f - f.falloff * (l / R));
+			if (wf > 0.f) v += FunnelVelocity(f, d, w) * wf;
+		}
+	}
+	return true;
+}
+
+// A vortex field's own motion at `p` - the law the fog is shaped with (vol_fluid.cs FunnelOrigin):
+// the turn omega = s * w / max(r, inner) (solid inside the core, s = the rim speed strength x 0.35),
+// pull > 0 in at the pull speed, < 0 out r-proportionally. `w` = the field's falloff weight at p.
+static glm::vec3 FunnelVelocity(const FFSnap& f, const glm::vec3& d, float w)
+{
+	const float s = f.strength * 0.35f, pull = f.pull;
+	const float inner = f.inner > 0.f ? std::min(f.inner, 0.9f * f.radius) : 0.15f * f.radius;
+	const glm::vec3 u = glm::normalize(glm::vec3(f.axis[0], f.axis[1], f.axis[2]));
+	const glm::vec3 dr = d - u * glm::dot(d, u);
+	const float rh = std::max(glm::length(dr), 1e-3f), rc = std::max(rh, inner);
+	const glm::vec3 e = dr / rh;
+	const float om = s * w / rc;
+	return glm::cross(u, e) * (om * rh) + e * (pull >= 0.f ? -pull * s : -pull * s * rh / f.radius);
+}
+
+// Summed acceleration from every snapshotted field at world point `p` (velocity `vel`).
+static glm::vec3 FieldAccel(const std::vector<FFSnap>& fs, const glm::vec3& p, const glm::vec3& vel, float seed, float t, float& wmax)
 {
 	glm::vec3 a(0); wmax = 0.f;
 	for (const FFSnap& f : fs)
@@ -50,7 +147,16 @@ static glm::vec3 FieldAccel(const std::vector<FFSnap>& fs, const glm::vec3& p, f
 		{
 			case 0: a -= dir * (f.strength * w); break;                        // attract
 			case 1: a += dir * (f.strength * w); break;                        // repel
-			case 2: a += glm::cross(glm::normalize(glm::vec3(f.axis[0], f.axis[1], f.axis[2])), dir) * (f.strength * w); break;   // vortex around the field's axis (world up unless Vortex Axis = Atom Up)
+			case 2:
+			{   // vortex: the air turns with the funnel and drags the particle toward that flow (the fog's response
+				// time); the drag lags the turn, so inertia carries the particle outward - the centrifugal drift -
+				// while the fog's clumping (Fog Clumping) pulls it back into the arms. The axial motion is its own.
+				const glm::vec3 u = glm::normalize(glm::vec3(f.axis[0], f.axis[1], f.axis[2]));
+				glm::vec3 dv = FunnelVelocity(f, d, w) - vel;
+				dv -= u * glm::dot(dv, u);
+				a += dv * (w / 0.35f);
+				break;
+			}
 			default:                                                           // turbulence
 			{
 				float s = f.strength * w;
@@ -65,7 +171,7 @@ static glm::vec3 FieldAccel(const std::vector<FFSnap>& fs, const glm::vec3& p, f
 
 // ---- curve/gradient evaluation (flattened key/stop arrays) --------------------------------
 // Curve keys are stride-4: (t, value, inTangent, outTangent); tangents are slopes dv/dt and
-// each segment is a cubic Hermite. Alpha is a coverage multiplier — always Clamp01 its result.
+// each segment is a cubic Hermite. Alpha is a coverage multiplier вЂ” always Clamp01 its result.
 static float Clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
 // Evaluates a stride-4 curve at t, or `def` when the curve is empty.
 static float EvalCurve(const std::vector<float>& c, float t, float def)
@@ -86,7 +192,7 @@ static float EvalCurve(const std::vector<float>& c, float t, float def)
 	return (2 * x3 - 3 * x2 + 1) * v0 + (x3 - 2 * x2 + x) * m0 + (-2 * x3 + 3 * x2) * v1 + (x3 - x2) * m1;
 }
 // Upgrades a legacy (t,v)-pair curve (size not a multiple of 4) to stride-4 keys with auto
-// tangents, then sorts keys ascending by t — EvalCurve's segment search requires that.
+// tangents, then sorts keys ascending by t вЂ” EvalCurve's segment search requires that.
 static void MigrateCurve(std::vector<float>& c)
 {
 	if (!c.empty() && c.size() % 4 != 0 && c.size() % 2 == 0)
@@ -397,6 +503,18 @@ void ParticleEmitter::Play()  { playing = true; ageSec = 0.f; }
 void ParticleEmitter::Stop()  { playing = false; }
 void ParticleEmitter::Clear() { parts.clear(); trailHist.clear(); }
 int  ParticleEmitter::AliveCount() { return (int)parts.size(); }
+Vector3 ParticleEmitter::ParticlePos(double i)
+{
+	const int k = (int)i;
+	if (k < 0 || k >= (int)parts.size()) return Vector3(0, 0, 0);
+	glm::vec3 p(parts[k].pos[0], parts[k].pos[1], parts[k].pos[2]);
+	if (localSpace && transform)
+	{
+		Vector3 cp = transform->globalPosition(); Quaternion Q = transform->globalRotation();
+		p = glm::vec3((float)cp.x, (float)cp.y, (float)cp.z) + glm::quat((float)Q.w, (float)Q.x, (float)Q.y, (float)Q.z) * p;
+	}
+	return Vector3(p.x, p.y, p.z);
+}
 
 // Random in [a,b] off the engine's seeded stream (deterministic per world run).
 static float Rnd(float a, float b) { return a + (float)Rand::Value("vfx") * (b - a); }
@@ -557,8 +675,8 @@ void ParticleEmitter::BurstAt(const Vector3& worldPos, double count)
 void ParticleEmitter::Advance(float dt)
 {
 	if (dt <= 0.f || !transform) return;
-	MigrateCurve(sizeOverLife); MigrateCurve(alphaOverLife);   // legacy (t,v) pairs → tangent keys
-	for (std::vector<float>* c : { &speedOverLife, &gravityOverLife, &dragOverLife, &windOverLife, &forceOverLife, &rotationOverLife, &stretchOverLife, &trailWidthOverLife, &lightOverLife, &lightRadiusOverLife })
+	MigrateCurve(sizeOverLife); MigrateCurve(alphaOverLife);   // legacy (t,v) pairs в†’ tangent keys
+	for (std::vector<float>* c : { &speedOverLife, &gravityOverLife, &dragOverLife, &windOverLife, &forceOverLife, &rotationOverLife, &stretchOverLife, &trailWidthOverLife, &lightOverLife, &lightRadiusOverLife, &fogDragOverLife })
 		MigrateCurve(*c);   // keeps them sorted by t (the editor may insert out of order)
 	// ---- emission (game thread) ----
 	ageSec += dt;
@@ -589,15 +707,21 @@ void ParticleEmitter::Advance(float dt)
 
 	if (parts.empty()) return;
 
-	// ---- integrate (parallel; PLAIN DATA only — the Jobs rule) ----
+	// ---- integrate (parallel; PLAIN DATA only вЂ” the Jobs rule) ----
 	static std::vector<FFSnap> fs; SnapFields(fs);
 	const float g = gravity * 9.81f;
 	const float windI = windInfluence;
 	const float dragK = drag;
 	const float t = ageSec;
-	// Wind::Sample locks the zone registry — sample ONCE and reuse for the whole batch.
+	// Wind::Sample locks the zone registry вЂ” sample ONCE and reuse for the whole batch.
 	Vector3 wv = windI > 0.f ? Wind::Sample(Vector3(cp.x, cp.y, cp.z)) : Vector3(0, 0, 0);
 	glm::vec3 wind((float)wv.x, (float)wv.y, (float)wv.z);
+	// Fog Drag: the fluid volumes' fields (a frame old), sampled per particle in WORLD space.
+	std::vector<std::shared_ptr<const NukeFogFluidCpu>> fogs;
+	if (fogDrag > 0.f) { AppInstance* app = AppInstance::GetSingleton(); if (app && app->render) app->render->getFogFluidCpu(fogs); }
+	const float fogK = fogDrag;
+	glm::quat simRot(1.f, 0.f, 0.f, 0.f); glm::vec3 simPos(0.f);
+	if (localSpace) { Quaternion Q = transform->globalRotation(); simRot = glm::quat((float)Q.w, (float)Q.x, (float)Q.y, (float)Q.z); simPos = glm::vec3((float)cp.x, (float)cp.y, (float)cp.z); }
 	std::vector<P>& ps = parts;
 	Jobs::ParallelFor(0, (int)ps.size(), 0, [&](int i)
 	{
@@ -615,9 +739,22 @@ void ParticleEmitter::Advance(float dt)
 			vel *= s1 / std::max(s0, 1e-3f);
 		}
 		glm::vec3 acc(0, -g * gM, 0);
-		float fw; acc += FieldAccel(fs, pos, p.seed, t, fw) * fM;
+		float fw; acc += FieldAccel(fs, pos, vel, p.seed, t, fw) * fM;
 		if (windI > 0.f) acc += (wind - vel) * (windI * wM);   // relax toward the wind vector
 		if (dragK > 0.f) acc -= vel * (dragK * dM);
+		if (fogK > 0.f && !fogs.empty())
+		{   // the fog carries the particle toward its own motion, as strongly as it is dense there
+			const glm::vec3 wp = localSpace ? simPos + simRot * pos : pos;
+			glm::vec3 vf, grad; float full;
+			if (FogMotionAt(fogs, fs, wp, vf, full, grad) && full > 0.001f)
+			{
+				const glm::vec3 wv = localSpace ? simRot * vel : vel;
+				const float m = EvalCurve(fogDragOverLife, lt, 1.f);
+				glm::vec3 dv = (vf - wv) * (fogK * full * m) + grad * (fogClump * m);   // carried by the fog + drawn into its clumps
+				if (localSpace) dv = glm::conjugate(simRot) * dv;
+				acc += dv;
+			}
+		}
 		vel += acc * dt;
 		pos += vel * dt;
 		p.rot += p.rotVel * EvalCurve(rotationOverLife, lt, 1.f) * dt;
@@ -765,6 +902,21 @@ void ParticleEmitter::Advance(float dt)
 		subBurstPts.clear();
 	}
 
+	static const bool vfxDbg = std::getenv("NUKE_VFX_DEBUG") != nullptr;
+	if (vfxDbg && fogK > 0.f && !fogs.empty() && !parts.empty() && (Time::getSingleton()->frame % 120) == 0)
+	{   // how much denser the fog is where the particles sit than on average (>1 = they gather in its clumps / arms)
+		double atP = 0.0; int n = 0;
+		for (const P& q : parts)
+		{
+			glm::vec3 wp(q.pos[0], q.pos[1], q.pos[2]); if (localSpace) wp = simPos + simRot * wp;
+			glm::vec3 vf, g; float full;
+			if (FogMotionAt(fogs, fs, wp, vf, full, g)) { atP += full; ++n; }
+		}
+		double gridMean = 0.0; size_t cells = 0;
+		for (const auto& f : fogs) { for (float r : f->rho) gridMean += r; cells += f->rho.size(); }
+		if (n && cells) std::cout << "[VFX]\t" << (atom ? atom->GetName() : "?") << ": fog at particles " << atP / n << " vs grid mean " << gridMean / cells
+		                          << " (x" << (gridMean > 0 ? (atP / n) / (gridMean / cells) : 0.0) << ", " << n << "/" << parts.size() << " in fog)" << std::endl;
+	}
 	SubmitLights();   // one-frame submissions, consumed by World::Render's light pack
 }
 
@@ -873,7 +1025,7 @@ void ParticleEmitter::OnRender(iRender* r, RenderPhase phase)
 	}
 	if (phase != RenderPhase::Transparent || !r) return;
 	// Editor preview: while not playing the sim advances from the render hook instead of Update.
-	// ONCE per frame — this hook fires per camera pass, and stepping the sim (collisions and all)
+	// ONCE per frame вЂ” this hook fires per camera pass, and stepping the sim (collisions and all)
 	// again for every viewport multiplied the cost by the number of open views.
 	AppInstance* app = AppInstance::GetSingleton();
 	if (app->playState == 0)

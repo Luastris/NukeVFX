@@ -30,7 +30,7 @@ public:
 	[[nuke::prop(label="Fluid", tip="Simulate the medium as a 3D fluid inside the shape: it rolls with the wind, obeys Force Fields (attract / repel / vortex / turbulence), parts around characters and bodies moving through it, and refills toward the shape.")]] bool fluid = false;
 	[[nuke::prop(label="Fluid Mode", enum="Grid,Clumps", tip="Grid: the density flows on the grid (wind, wakes, holes); a vortex shapes it into a funnel. Clumps: the medium is parcels carried by the flow - they die in a vortex's drain and are born at the edges.")]] int fluidMode = 0;
 	[[nuke::prop(label="Clump Size", min=0, tip="Clumps: a parcel's radius in metres (0 = from the shape's size). Smaller = finer, more parcels.")]] float clumpSize = 0.0f;
-	[[nuke::prop(label="Fluid Resolution", min=8, max=192, tip="Simulation cells along the shape's longest axis (48 = smooth swirls at a few metres, 96 = fine detail; cost grows with the cube).")]] int fluidResolution = 48;
+	[[nuke::prop(label="Fluid Resolution", min=8, tip="Simulation cells along the shape's longest axis (48 = smooth swirls at a few metres, 96 = fine detail; cost grows with the cube).")]] int fluidResolution = 48;
 	[[nuke::prop(label="Turbulence", min=0, tip="Self-stirring of the fluid, m/s (0 = only wind and bodies move it).")]] float fluidTurbulence = 0.3f;
 	[[nuke::prop(label="Refill", min=0, tip="How fast pushed-away or blown-away medium comes back, per second (0.5 = a couple of seconds). Clumps: how fast a newborn clump gains its weight.")]] float fluidRefill = 0.5f;
 	[[nuke::prop(label="Dissipation", min=0, tip="Density lost per second while it drifts (0 = none). Clumps: how fast a clump dissolves in a drain or beyond the shape.")]] float fluidDissipation = 0.1f;

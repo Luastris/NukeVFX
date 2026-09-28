@@ -1,4 +1,4 @@
-#include <NukeVFX/ScatterVolume.h>
+﻿#include <NukeVFX/ScatterVolume.h>
 #include <render/irender.h>
 #include <algorithm>
 
@@ -18,7 +18,7 @@ void ScatterVolume::FillMedium(NukeFogVolumeDesc& d) const
 	d.heightFalloff = std::max(heightFalloff, 0.0f);
 	d.fluidMode = fluidMode; d.clumpSize = std::max(clumpSize, 0.0f);
 	d.fluid = fluid ? 1 : 0;
-	d.fluidRes = std::max(8, std::min(192, fluidResolution));
+	d.fluidRes = std::max(8, fluidResolution);   // the renderer caps at the device's 3D texture limit, nothing else
 	d.fluidTurbulence = std::max(fluidTurbulence, 0.0f); d.fluidRefill = std::max(fluidRefill, 0.0f); d.fluidDissipation = std::max(fluidDissipation, 0.0f);
 }
 
