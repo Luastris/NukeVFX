@@ -558,6 +558,8 @@ void ParticleEmitter::Advance(float dt)
 {
 	if (dt <= 0.f || !transform) return;
 	MigrateCurve(sizeOverLife); MigrateCurve(alphaOverLife);   // legacy (t,v) pairs → tangent keys
+	for (std::vector<float>* c : { &speedOverLife, &gravityOverLife, &dragOverLife, &windOverLife, &forceOverLife, &rotationOverLife, &stretchOverLife, &trailWidthOverLife, &lightOverLife, &lightRadiusOverLife })
+		MigrateCurve(*c);   // keeps them sorted by t (the editor may insert out of order)
 	// ---- emission (game thread) ----
 	ageSec += dt;
 	const bool emitting = playing && (duration <= 0.f || ageSec <= duration);
@@ -600,15 +602,25 @@ void ParticleEmitter::Advance(float dt)
 	Jobs::ParallelFor(0, (int)ps.size(), 0, [&](int i)
 	{
 		P& p = ps[i];
+		// Over-life multipliers (an empty curve = 1) at this particle's normalized age.
+		const float lt = p.maxLife > 0.f ? 1.f - p.life / p.maxLife : 0.f;
+		const float gM = EvalCurve(gravityOverLife, lt, 1.f), dM = EvalCurve(dragOverLife, lt, 1.f);
+		const float wM = EvalCurve(windOverLife, lt, 1.f),    fM = EvalCurve(forceOverLife, lt, 1.f);
 		glm::vec3 pos(p.pos[0], p.pos[1], p.pos[2]);
 		glm::vec3 vel(p.vel[0], p.vel[1], p.vel[2]);
-		glm::vec3 acc(0, -g, 0);
-		float fw; acc += FieldAccel(fs, pos, p.seed, t, fw);
-		if (windI > 0.f) acc += (wind - vel) * windI;          // relax toward the wind vector
-		if (dragK > 0.f) acc -= vel * dragK;
+		if (!speedOverLife.empty())
+		{   // the speed follows the curve's SHAPE: scale by this step's ratio, so forces still add
+			const float ltPrev = p.maxLife > 0.f ? std::max(0.f, 1.f - (p.life + dt) / p.maxLife) : 0.f;
+			const float s0 = EvalCurve(speedOverLife, ltPrev, 1.f), s1 = EvalCurve(speedOverLife, lt, 1.f);
+			vel *= s1 / std::max(s0, 1e-3f);
+		}
+		glm::vec3 acc(0, -g * gM, 0);
+		float fw; acc += FieldAccel(fs, pos, p.seed, t, fw) * fM;
+		if (windI > 0.f) acc += (wind - vel) * (windI * wM);   // relax toward the wind vector
+		if (dragK > 0.f) acc -= vel * (dragK * dM);
 		vel += acc * dt;
 		pos += vel * dt;
-		p.rot += p.rotVel * dt;
+		p.rot += p.rotVel * EvalCurve(rotationOverLife, lt, 1.f) * dt;
 		p.life -= dt;
 		p.pos[0] = pos.x; p.pos[1] = pos.y; p.pos[2] = pos.z;
 		p.vel[0] = vel.x; p.vel[1] = vel.y; p.vel[2] = vel.z;
@@ -1008,7 +1020,7 @@ void ParticleEmitter::Draw(iRender* r)
 				float spd = glm::length(v);
 				glm::vec3 axis = spd > 1e-4f ? v / spd : up;
 				glm::vec3 side = glm::normalize(glm::cross(axis, glm::vec3(view[2], view[6], view[10])) + glm::vec3(1e-5f));
-				quad(wp, side * (sz * 0.5f), axis * (sz * 0.5f + spd * stretch), col);
+				quad(wp, side * (sz * 0.5f), axis * (sz * 0.5f + spd * stretch * EvalCurve(stretchOverLife, lt, 1.f)), col);
 			}
 			else                 // camera-facing billboard (rotated)
 			{
@@ -1038,7 +1050,7 @@ void ParticleEmitter::Draw(iRender* r)
 			const float gEffT = glow * EvalCurve(glowOverLife, lt, 1.f);
 			if (gEffT > 0.f) { const float g = 1.f + gEffT; col[0] *= g; col[1] *= g; col[2] *= g; }   // HDR boost -> bloom
 			const float* h = trailHist.data() + (size_t)oi * kTrailCap * 3;
-			const float headW = std::max(0.001f, sz * trailWidth * 0.5f);   // half-width at the head
+			const float headW = std::max(0.001f, sz * trailWidth * EvalCurve(trailWidthOverLife, lt, 1.f) * 0.5f);   // half-width at the head
 			for (int sgi = kTrailCap - segs; sgi < kTrailCap - 1; ++sgi)
 			{
 				glm::vec3 a(h[sgi * 3], h[sgi * 3 + 1], h[sgi * 3 + 2]);                       // older
@@ -1194,7 +1206,7 @@ void ParticleEmitter::BuildRTQuads(iRender* r)
 				float spd = glm::length(vel);
 				glm::vec3 axis = spd > 1e-4f ? vel / spd : up;
 				glm::vec3 side = glm::normalize(glm::cross(axis, camF) + glm::vec3(1e-5f));
-				rv = side * (sz * 0.5f); uv2 = axis * (sz * 0.5f + spd * stretch);
+				rv = side * (sz * 0.5f); uv2 = axis * (sz * 0.5f + spd * stretch * EvalCurve(stretchOverLife, lt, 1.f));
 			}
 			else                 // camera-facing billboard (rotated)
 			{
@@ -1280,7 +1292,8 @@ void ParticleEmitter::BuildRTQuads(iRender* r)
 			EvalGradient(colorGradient, lt, col);
 			if (col[3] < 0.02f) continue;
 			const float* h = trailHist.data() + (size_t)i * kTrailCap * 3;
-			const float headW = (sz * trailWidth * 0.5f) < 0.001f ? 0.001f : (sz * trailWidth * 0.5f);
+			const float tw = trailWidth * EvalCurve(trailWidthOverLife, lt, 1.f);
+			const float headW = (sz * tw * 0.5f) < 0.001f ? 0.001f : (sz * tw * 0.5f);
 			for (int sgi = kTrailCap - segs; sgi < kTrailCap - 1 && tq < tcap; ++sgi)
 			{
 				glm::vec3 a(h[sgi * 3], h[sgi * 3 + 1], h[sgi * 3 + 2]);
@@ -1341,7 +1354,7 @@ void ParticleEmitter::SubmitLights()
 		    * glm::mat4_cast(glm::quat((float)Q.w, (float)Q.x, (float)Q.y, (float)Q.z));
 	}
 	const float gI = 1.f + (glow > 0.f ? glow : 0.f);
-	struct LP { float w; float m; glm::vec3 p; float c[3]; };
+	struct LP { float w; float m; glm::vec3 p; float c[3]; float rr; };   // rr: Light Radius Over Life
 	static std::vector<LP> lps; lps.clear();
 	for (const P& p : parts)
 	{
@@ -1349,42 +1362,42 @@ void ParticleEmitter::SubmitLights()
 		float col[4] = { (float)startColor.r, (float)startColor.g, (float)startColor.b,
 		                 (float)startColor.a * Clamp01(EvalCurve(alphaOverLife, lt, 1.f)) };
 		EvalGradient(colorGradient, lt, col);
-		float m = EvalCurve(glowOverLife, lt, 1.f);
+		float m = EvalCurve(glowOverLife, lt, 1.f) * EvalCurve(lightOverLife, lt, 1.f);
 		if (lightBindAlpha) m *= Clamp01(col[3]);
 		if (m < 0.005f || col[3] < 0.005f) continue;   // fully faded out
 		float sz = p.size * EvalCurve(sizeOverLife, lt, 1.f);
 		glm::vec3 wp(p.pos[0], p.pos[1], p.pos[2]);
 		if (localSpace) wp = glm::vec3(l2w * glm::vec4(wp, 1));
-		lps.push_back({ col[3] * sz, m, wp, { col[0], col[1], col[2] } });
+		lps.push_back({ col[3] * sz, m, wp, { col[0], col[1], col[2] }, EvalCurve(lightRadiusOverLife, lt, 1.f) });
 	}
 	if (lps.empty()) return;
-	auto submit = [&](const glm::vec3& pos, const float c[3], float m)
+	auto submit = [&](const glm::vec3& pos, const float c[3], float m, float rr)
 	{
 		NukeLight nl; nl.type = 1;   // point
 		nl.pos[0] = pos.x; nl.pos[1] = pos.y; nl.pos[2] = pos.z;
 		nl.color[0] = c[0] * gI; nl.color[1] = c[1] * gI; nl.color[2] = c[2] * gI;
-		nl.intensity = lightIntensity * m; nl.range = lightRadius; nl.castShadows = 0;
+		nl.intensity = lightIntensity * m; nl.range = lightRadius * rr; nl.castShadows = 0;
 		FrameLights::Submit(nl);
 	};
 	if (lightCount <= 0)
 	{
 		// One light per particle; the renderer clamps the world set at its 256-light budget.
-		for (const LP& l : lps) submit(l.p, l.c, l.m);
+		for (const LP& l : lps) submit(l.p, l.c, l.m, l.rr);
 	}
 	else if (lightCount == 1)
 	{
-		glm::vec3 cpos(0); float cw = 0, cm = 0; float cc[3] = { 0, 0, 0 };
-		for (const LP& l : lps) { cpos += l.p * l.w; cw += l.w; cm += l.m * l.w; cc[0] += l.c[0] * l.w; cc[1] += l.c[1] * l.w; cc[2] += l.c[2] * l.w; }
+		glm::vec3 cpos(0); float cw = 0, cm = 0, cr = 0; float cc[3] = { 0, 0, 0 };
+		for (const LP& l : lps) { cpos += l.p * l.w; cw += l.w; cm += l.m * l.w; cr += l.rr * l.w; cc[0] += l.c[0] * l.w; cc[1] += l.c[1] * l.w; cc[2] += l.c[2] * l.w; }
 		if (cw <= 0.f) return;
 		cpos /= cw; float c[3] = { cc[0] / cw, cc[1] / cw, cc[2] / cw };
-		submit(cpos, c, cm / cw);
+		submit(cpos, c, cm / cw, cr / cw);
 	}
 	else
 	{
 		const int want = lightCount > 256 ? 256 : lightCount;
 		const int take = (int)lps.size() < want ? (int)lps.size() : want;
 		std::partial_sort(lps.begin(), lps.begin() + take, lps.end(), [](const LP& a, const LP& b) { return a.w * a.m > b.w * b.m; });
-		for (int i = 0; i < take; ++i) submit(lps[i].p, lps[i].c, lps[i].m);
+		for (int i = 0; i < take; ++i) submit(lps[i].p, lps[i].c, lps[i].m, lps[i].rr);
 	}
 }
 

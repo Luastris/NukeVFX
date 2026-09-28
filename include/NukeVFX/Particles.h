@@ -34,14 +34,14 @@ class NUKEVFX_API ParticleEmitter : public Component
 	NUKE_CLASS(ParticleEmitter, Component, "Effects")
 public:
 	// ---- emission --------------------------------------------------------------------------
-	[[nuke::prop(label="Playing")]]                     bool  playing = true;
+	[[nuke::prop(label="Playing", section="Emission")]]                     bool  playing = true;
 	[[nuke::prop(label="Duration", min=0, tip="Seconds of emission; 0 = loop forever.")]] float duration = 0.0f;
 	[[nuke::prop(label="Max Particles", min=1)]]        int   maxParticles = 1000;
 	[[nuke::prop(label="Rate", min=0, tip="Particles per second.")]]             float rate = 50.0f;
 	[[nuke::prop(label="Burst Count", min=0, tip="Particles per burst (0 = no bursts).")]] int burstCount = 0;
 	[[nuke::prop(label="Burst Interval", min=0.01)]]    float burstInterval = 1.0f;
 	// ---- shape -----------------------------------------------------------------------------
-	[[nuke::prop(label="Shape", enum="Point,Sphere,Box,Cone,MeshSurface,CameraBox", tip="CameraBox: a box that rides the MAIN camera (Shape Extents around Camera Offset), particles spawn falling - rain, snow, wind-blown dust around the viewer.")]] int shape = 1;
+	[[nuke::prop(label="Shape", section="Shape", enum="Point,Sphere,Box,Cone,MeshSurface,CameraBox", tip="CameraBox: a box that rides the MAIN camera (Shape Extents around Camera Offset), particles spawn falling - rain, snow, wind-blown dust around the viewer.")]] int shape = 1;
 	[[nuke::prop(label="Shape Radius", min=0)]]         float shapeRadius = 0.5f;      // sphere/cone base
 	[[nuke::prop(label="Shape Extents")]]               Vector3 shapeExtents = Vector3(0.5, 0.5, 0.5);   // box half
 	[[nuke::prop(label="Camera Offset", tip="CameraBox: the box centre relative to the camera - x right, y up, z ahead (flattened).")]] Vector3 cameraOffset = Vector3(0, 6, 4);
@@ -50,7 +50,7 @@ public:
 	[[nuke::prop(asset="mesh", label="Emit Mesh", tip="MeshSurface shape: emit from this mesh's triangles. Empty = this atom's own rendered mesh, else the parent atom's (prefab flames riding a burning object).")]] std::string emitMeshGuid;
 	[[nuke::prop(label="Emit Mask", tip="MeshSurface shape: emit only where this painted surface condition is hot on the source atom (e.g. \"burn\" - flames track the fire front and grow with it). Cold samples are skipped, so emission scales with the hot area. Empty = the whole surface.")]] std::string emitMask;
 	// ---- initial ranges --------------------------------------------------------------------
-	[[nuke::prop(label="Life Min", min=0.01)]]          float lifeMin = 1.0f;
+	[[nuke::prop(label="Life Min", min=0.01, section="Particle")]]          float lifeMin = 1.0f;
 	[[nuke::prop(label="Life Max", min=0.01)]]          float lifeMax = 2.0f;
 	[[nuke::prop(label="Speed Min")]]                   float speedMin = 1.0f;
 	[[nuke::prop(label="Speed Max")]]                   float speedMax = 3.0f;
@@ -60,11 +60,11 @@ public:
 	[[nuke::prop(label="Inherit Velocity", min=0, max=1, tip="Fraction of the atom's velocity added at spawn.")]] float inheritVelocity = 0.0f;
 	[[nuke::prop(label="Local Space", tip="Simulate in the atom's space (particles follow it).")]] bool localSpace = false;
 	// ---- forces ----------------------------------------------------------------------------
-	[[nuke::prop(label="Gravity", tip="Multiplier of world gravity.")]] float gravity = 0.0f;
+	[[nuke::prop(label="Gravity", section="Forces", tip="Multiplier of world gravity.")]] float gravity = 0.0f;
 	[[nuke::prop(label="Drag", min=0)]]                 float drag = 0.0f;
 	[[nuke::prop(label="Wind Influence", min=0, max=1)]] float windInfluence = 0.0f;   // nuke::Wind::Sample
 	// ---- collision -------------------------------------------------------------------------
-	[[nuke::prop(label="Collision", enum="Off,World,Surface", tip="World = everything (physics). Surface = only the referenced atom's meshes.")]] int collision = 0;
+	[[nuke::prop(label="Collision", section="Collision", enum="Off,World,Surface", tip="World = everything (physics). Surface = only the referenced atom's meshes.")]] int collision = 0;
 	[[nuke::prop(label="Surface", tip="Surface mode: the one atom (subtree) particles collide with.")]] Atom* collisionSurface = nullptr;
 	[[nuke::prop(label="Bounce", min=0, max=1)]]        float bounce = 0.3f;
 	[[nuke::prop(label="Collision Dampen", min=0, max=1)]] float collideDampen = 0.2f;
@@ -78,14 +78,26 @@ public:
 	[[nuke::prop(label="Surface Hits", tip="Collisions fire the hit surface's LiveMaterial reaction (its own decal/prefab/sound)")]] bool surfaceHits = false;
 	[[nuke::prop(label="Hit Type", tip="Typed hit id sent to the surface (empty matches its any-hit entry)")]] std::string surfaceHitType;
 	// ---- over-lifetime ---------------------------------------------------------------------
-	[[nuke::prop(label="Size Over Life", widget="curve")]]  std::vector<float> sizeOverLife;    // keys (t,v,inTan,outTan)
+	// Every curve is a MULTIPLIER of its parameter over the particle's normalized life (t 0..1);
+	// empty = 1. Keys are stride-4 (t, value, inTan, outTan), edited with the curve editor.
+	[[nuke::prop(label="Size Over Life", widget="curve", section="Over Life")]]  std::vector<float> sizeOverLife;    // keys (t,v,inTan,outTan)
 	[[nuke::prop(label="Alpha Over Life", widget="curve", min=0, max=1)]] std::vector<float> alphaOverLife;   // keys (t,v,inTan,outTan); alpha is 0..1
+	[[nuke::prop(label="Speed Over Life", widget="curve", min=0, tip="Multiplier of the particle's speed: its velocity follows this shape (forces still add). 0 stops it; it cannot restart from exactly 0 - use a small value.")]] std::vector<float> speedOverLife;
+	[[nuke::prop(label="Gravity Over Life", widget="curve", tip="Multiplier of Gravity over life.")]] std::vector<float> gravityOverLife;
+	[[nuke::prop(label="Drag Over Life", widget="curve", min=0, tip="Multiplier of Drag over life.")]] std::vector<float> dragOverLife;
+	[[nuke::prop(label="Wind Over Life", widget="curve", min=0, tip="Multiplier of Wind Influence over life.")]] std::vector<float> windOverLife;
+	[[nuke::prop(label="Force Fields Over Life", widget="curve", tip="Multiplier of every Force Field's pull over life.")]] std::vector<float> forceOverLife;
+	[[nuke::prop(label="Rotation Over Life", widget="curve", tip="Multiplier of the spin (Rotation Speed) over life.")]] std::vector<float> rotationOverLife;
+	[[nuke::prop(label="Stretch Over Life", widget="curve", min=0, tip="Stretched render: multiplier of Stretch over life.")]] std::vector<float> stretchOverLife;
+	[[nuke::prop(label="Trail Width Over Life", widget="curve", min=0, tip="Multiplier of Trail Width over life.")]] std::vector<float> trailWidthOverLife;
+	[[nuke::prop(label="Light Over Life", widget="curve", min=0, tip="Multiplier of the particle light's intensity over life (on top of Glow Over Life).")]] std::vector<float> lightOverLife;
+	[[nuke::prop(label="Light Radius Over Life", widget="curve", min=0, tip="Multiplier of Light Radius over life.")]] std::vector<float> lightRadiusOverLife;
 
 	[[nuke::prop(label="Color Gradient", widget="gradient")]] std::vector<float> colorGradient; // (t,r,g,b) stops
 	[[nuke::prop(label="Start Color")]]                 Color startColor = Color(1, 1, 1, 1);
 	// ---- render ----------------------------------------------------------------------------
 	// Value 2 is legacy: it draws billboard + trail (the trail is an option, not a mode).
-	[[nuke::prop(label="Render", enum="Billboard,Stretched,Billboard + Trail,Mesh")]] int renderMode = 0;
+	[[nuke::prop(label="Render", section="Render", enum="Billboard,Stretched,Billboard + Trail,Mesh")]] int renderMode = 0;
 	[[nuke::prop(asset="texture", label="Texture")]]    std::string textureGuid;   // billboard/stretched
 	[[nuke::prop(label="Particle Shape", enum="Quad,Circle,Ring,Spark,Star,Smoke", tip="Built-in shape when no Texture is set (procedural, no asset needed).")]] int spriteShape = 1;
 	[[nuke::prop(asset="mesh", label="Particle Mesh")]] std::string meshGuid;      // Mesh mode (7.1 instancing)
@@ -102,7 +114,7 @@ public:
 	[[nuke::prop(asset="texture", label="Trail Texture", tip="Stretched ALONG the whole ribbon (u across, v head->tail). Empty = plain ribbon.")]] std::string trailTextureGuid;
 	[[nuke::prop(label="Soft Fade", min=0, tip="Soft particles: fade within this distance of scene geometry (needs a depth prepass - TAA/SSR/decals on the camera). 0 = off.")]] float softFade = 0.0f;
 	// ---- volumetric fog interplay (World Settings > Volumetric Fog) ---------------------------
-	[[nuke::prop(label="Volumetric Lighting", min=0, max=1, tip="Light the sprites by the froxel fog grid (sun through its shadows, point/spot, probe ambient): 1 = the grid's light replaces the authored brightness - smoke sits in the god rays. Needs Volumetric Fog on.")]] float volumeLight = 0.0f;
+	[[nuke::prop(label="Volumetric Lighting", section="Lighting", min=0, max=1, tip="Light the sprites by the froxel fog grid (sun through its shadows, point/spot, probe ambient): 1 = the grid's light replaces the authored brightness - smoke sits in the god rays. Needs Volumetric Fog on.")]] float volumeLight = 0.0f;
 	[[nuke::prop(label="Six-Way Lighting", tip="Hero smoke: two lightmaps hold the puff lit from six directions (A.rgb = +right/-right/+up, B.rgb = -up/+front/-front, A.a = opacity); every scene light shades the puff by its direction.")]] bool sixWay = false;
 	[[nuke::prop(asset="texture", label="Six-Way Map A")]] std::string sixWayGuidA;
 	[[nuke::prop(asset="texture", label="Six-Way Map B")]] std::string sixWayGuidB;
@@ -116,7 +128,7 @@ public:
 	[[nuke::prop(label="Light Particles", min=0, max=256, tip="0 = EVERY particle carries its own light (UE-style); 1 = one aggregated light at the cloud's center; N = the N biggest particles. The engine budget is 256 lights per world (extras are dropped).")]] int lightCount = 0;
 	[[nuke::prop(label="Bind Light To Alpha", tip="The particle's alpha directly scales its light — fading particles dim smoothly instead of switching off. Glow Over Life scales the light too, always.")]] bool lightBindAlpha = true;
 	// ---- sub-emitter -----------------------------------------------------------------------
-	[[nuke::prop(label="Sub Emitter", tip="Another atom's ParticleEmitter: burst there when a particle dies/collides.")]] Atom* subEmitter = nullptr;
+	[[nuke::prop(label="Sub Emitter", section="Sub Emitter", tip="Another atom's ParticleEmitter: burst there when a particle dies/collides.")]] Atom* subEmitter = nullptr;
 	[[nuke::prop(label="Sub Emitter Count", min=0)]]    int subEmitterCount = 5;
 	[[nuke::prop(label="Sub On Collision", tip="Trigger the sub emitter on collision instead of death.")]] bool subOnCollision = false;
 
