@@ -3,6 +3,8 @@
 #include <API/Model/resdb.h>
 #include <API/Model/Jobs.h>
 #include <API/Model/Wind.h>
+#include <API/Model/Migrations.h>   // ParticleEmitter data version + steps
+#include <API/Model/Quality.h>      // particle counts scale with the preset
 #include <API/Model/Physics.h>
 #include <API/Model/Time.h>
 #include <API/Model/Rand.h>
@@ -569,7 +571,8 @@ void ParticleEmitter::BurstAt(const Vector3& worldPos, double count)
 			sScl = glm::vec3((float)sc.x, (float)sc.y, (float)sc.z);
 		}
 	}
-	for (int i = 0; i < (int)count && (int)parts.size() < maxParticles; ++i)
+	const int maxP = std::max(1, (int)(maxParticles * nuke::Quality::ParticleScale()));   // the preset scales the budget
+	for (int i = 0; i < (int)count && (int)parts.size() < maxP; ++i)
 	{
 		bool worldSample = false;   // case 4 via srcMesh: lp/dir already world-space
 		glm::vec3 lp(0), dir(0, 1, 0);
@@ -672,6 +675,33 @@ void ParticleEmitter::BurstAt(const Vector3& worldPos, double count)
 	}
 }
 
+// The curve upgrade as a registered data step (data version 1): the JSON form of MigrateCurve,
+// so files are rewritten by the batch and documents before the component reads them.
+static const bool s_vfxMigrations = []
+{
+	nuke::Migrations::DeclareComponentVersion("ParticleEmitter", 1);
+	nuke::Migrations::RegisterComponent("ParticleEmitter", 0, "over-life curves: (t,v) pairs -> tangent keys", [](nlohmann::json& c)
+	{
+		auto pit = c.find("props");
+		if (pit == c.end() || !pit->is_object()) return;
+		static const char* kCurves[] = { "sizeOverLife", "alphaOverLife", "speedOverLife", "gravityOverLife", "dragOverLife", "windOverLife", "forceOverLife",
+		                                 "rotationOverLife", "stretchOverLife", "trailWidthOverLife", "lightOverLife", "lightRadiusOverLife", "fogDragOverLife" };
+		for (const char* k : kCurves)
+		{
+			auto it = pit->find(k);
+			if (it == pit->end() || !it->is_array()) continue;
+			std::vector<float> cv;
+			for (const nlohmann::json& v : *it) if (v.is_number()) cv.push_back(v.get<float>());
+			if (cv.size() != it->size()) continue;
+			const size_t before = cv.size();
+			MigrateCurve(cv);
+			if (cv.size() == before && before % 4 == 0) continue;   // already keys (sorting alone is not a format change)
+			*it = cv;
+		}
+	});
+	return true;
+}();
+
 void ParticleEmitter::Advance(float dt)
 {
 	if (dt <= 0.f || !transform) return;
@@ -699,10 +729,11 @@ void ParticleEmitter::Advance(float dt)
 	lastPos[0] = cp.x; lastPos[1] = cp.y; lastPos[2] = cp.z; hasLastPos = true;
 
 	// A live maxParticles reduction applies immediately (overflow dies now).
-	if ((int)parts.size() > maxParticles && maxParticles > 0)
+	const int maxLive = std::max(1, (int)(maxParticles * nuke::Quality::ParticleScale()));
+	if ((int)parts.size() > maxLive && maxParticles > 0)
 	{
-		parts.resize(maxParticles);
-		trailHist.resize((size_t)maxParticles * kTrailCap * 3);
+		parts.resize(maxLive);
+		trailHist.resize((size_t)maxLive * kTrailCap * 3);
 	}
 
 	if (parts.empty()) return;
