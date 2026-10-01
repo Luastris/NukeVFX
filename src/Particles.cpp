@@ -1422,6 +1422,7 @@ void ParticleEmitter::BuildRTQuads(iRender* r)
 			rtMat->metallic = 0.f; rtMat->roughness = 1.f; rtMat->specular = 0.f;
 			rtMat->emissive = Color(1, 1, 1, 1);
 			rtMat->emissiveIntensity = 1.0f;   // the glow boost is per-vertex (color pool)
+			rtMat->blendMode = (blend == 1) ? Material::Additive : Material::Transparent;   // reflections layer the sprites as the raster blends them
 			float pos[3] = { 0, 0, 0 }, quat[4] = { 0, 0, 0, 1 }, scale[3] = { 1, 1, 1 };   // verts are world-space
 			r->addRTInstance(rtMesh, rtMat, pos, quat, scale, inReflections, castShadows);
 		}
@@ -1518,6 +1519,7 @@ void ParticleEmitter::BuildRTQuads(iRender* r)
 			rtTrailMat->metallic = 0.f; rtTrailMat->roughness = 1.f; rtTrailMat->specular = 0.f;
 			rtTrailMat->emissive = Color(1, 1, 1, 1);
 			rtTrailMat->emissiveIntensity = 1.0f;   // glow boost is per-vertex (color pool)
+			rtTrailMat->blendMode = (blend == 1) ? Material::Additive : Material::Transparent;
 			float pos[3] = { 0, 0, 0 }, quat[4] = { 0, 0, 0, 1 }, scale[3] = { 1, 1, 1 };
 			r->addRTInstance(rtTrailMesh, rtTrailMat, pos, quat, scale, inReflections, castShadows);
 		}
